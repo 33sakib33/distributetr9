@@ -1,0 +1,7 @@
+{
+  "Distro": "Ubuntu",
+  "Api": "http://192.168.68.118:8080",
+  "Config": "/etc/lab-agent/config.json",
+  "AgentDir": "/home/sakib/distributetr9_node",
+  "WslUser": "sakib"
+}

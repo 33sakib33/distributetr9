@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lab}
+      POSTGRES_DB: ${POSTGRES_DB:-lab}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lab} -d ${POSTGRES_DB:-lab}"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-labminio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-labminio}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  registry:
+    image: registry:2
+    ports:
+      - "${REGISTRY_PORT:-5001}:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - registrydata:/var/lib/registry
+
+  control:
+    build: ./control
+    ports:
+      - "${CONTROL_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-lab}:${POSTGRES_PASSWORD:-lab}@postgres:5432/${POSTGRES_DB:-lab}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-labminio}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-labminio}
+      MINIO_BUCKET: ${MINIO_BUCKET:-lab}
+      MINIO_SECURE: "false"
+      DEV_AUTH: ${DEV_AUTH:-1}
+      DEV_AUTH_ADMIN: ${DEV_AUTH_ADMIN:-1}
+      ADMIN_EMAILS: ${ADMIN_EMAILS:-admin@uni.edu}
+      OIDC_DEV: ${OIDC_DEV:-1}
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://127.0.0.1:8080/oidc}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-lab-portal}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-lab-oidc-dev-secret}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-http://127.0.0.1:8080/auth/callback}
+      PORTAL_BASE_URL: ${PORTAL_BASE_URL:-http://127.0.0.1:3000}
+      LEASE_TTL_SECONDS: ${LEASE_TTL_SECONDS:-30}
+      HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-10}
+      DISCONNECT_GRACE_SECONDS: ${DISCONNECT_GRACE_SECONDS:-60}
+      DISK_WATERMARK_BYTES: ${DISK_WATERMARK_BYTES:-1073741824}
+      TOKEN_PEPPER: ${TOKEN_PEPPER:-dev-token-pepper-change-me}
+      PUBLIC_BASE_URL: http://${LAN_HOST:-127.0.0.1}:${CONTROL_PORT:-8080}
+      REGISTRY_URL: ${REGISTRY_URL:-}
+    volumes:
+      - ./control/app:/app/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+
+volumes:
+  pgdata:
+  miniodata:
+  registrydata:

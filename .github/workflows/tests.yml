@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scheduler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start Postgres and MinIO
+        run: docker compose up -d --wait postgres minio
+      - name: Wait for MinIO
+        run: |
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker compose logs minio
+          exit 1
+      - name: Install control dependencies
+        run: pip install -r control/requirements.txt
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://lab:lab@127.0.0.1:5433/lab
+          MINIO_ENDPOINT: 127.0.0.1:9000
+          MINIO_ACCESS_KEY: labminio
+          MINIO_SECRET_KEY: labminio
+          MINIO_BUCKET: lab
+          MINIO_SECURE: "false"
+        run: pytest tests -v

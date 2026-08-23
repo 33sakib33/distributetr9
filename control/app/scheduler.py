@@ -1,0 +1,652 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timedelta
+from typing import Any
+
+from sqlalchemy import Select, func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.config import settings
+from app.enums import (
+    ACTIVE_ATTEMPT_STATES,
+    FORWARD_TRANSITIONS,
+    RETRYABLE_FAILURES,
+    TERMINAL_ATTEMPT_STATES,
+)
+from app.errors import AppError
+from app.models import Artifact, Environment, Job, JobAttempt, Node, Quota
+from app.storage import storage
+
+
+def _resources(job: Job) -> dict[str, Any]:
+    return job.resources if isinstance(job.resources, dict) else {}
+
+
+def node_fits_job(node: Node, job: Job) -> bool:
+    return fit_failure(node, job) is None
+
+
+def fit_failure(node: Node, job: Job) -> str | None:
+    res = _resources(job)
+    gpu_class = res.get("gpu_class")
+    if settings.strict_node_class:
+        if gpu_class != node.compatibility_class:
+            return "class"
+    elif gpu_class and gpu_class not in {node.compatibility_class, node.gpu_model}:
+        return "class"
+    min_vram = int(res.get("min_vram_mb") or 0)
+    if node.vram_allocatable_mb < min_vram:
+        return "vram"
+    cpu = int(res.get("cpu_cores") or 0)
+    if cpu and node.cpu_cores < cpu:
+        return "cpu"
+    ram = int(res.get("ram_mb") or 0)
+    if ram and node.ram_mb < ram:
+        return "ram"
+    min_cc = res.get("min_compute_capability")
+    if min_cc:
+        try:
+            if float(node.compute_capability) < float(min_cc):
+                return "cc"
+        except (TypeError, ValueError):
+            return "cc"
+    return None
+
+
+def _job_min_vram(job: Job) -> int:
+    return int(_resources(job).get("min_vram_mb") or 0)
+
+
+def is_high_vram_node(node: Node) -> bool:
+    return node.vram_allocatable_mb >= settings.high_vram_mb
+
+
+def job_needs_high_vram(job: Job) -> bool:
+    return _job_min_vram(job) >= settings.high_vram_reserve_min
+
+
+def _aware(ts: datetime, now: datetime) -> datetime:
+    if ts.tzinfo is None and now.tzinfo is not None:
+        return ts.replace(tzinfo=now.tzinfo)
+    return ts
+
+
+def job_age_seconds(job: Job, now: datetime) -> float:
+    created = job.created_at
+    if created is None:
+        return 0
+    return max(0.0, (now - _aware(created, now)).total_seconds())
+
+
+def reserved_skip(node: Node, job: Job, now: datetime, queued: list[Job]) -> bool:
+    if not is_high_vram_node(node) or job_needs_high_vram(job):
+        return False
+    large_waiting = any(other.id != job.id and job_needs_high_vram(other) and node_fits_job(node, other) for other in queued)
+    aged = job_age_seconds(job, now) >= settings.aging_steal_seconds
+    if large_waiting:
+        return True
+    return not aged
+
+
+def pending_reason_for(node: Node | None, job: Job) -> str:
+    if node:
+        return f"node {node.hostname} starting"
+    res = _resources(job)
+    gpu_class = res.get("gpu_class")
+    min_vram = int(res.get("min_vram_mb") or 0)
+    if gpu_class:
+        return f"waiting for node class {gpu_class}"
+    if min_vram:
+        gb = max(1, round(min_vram / 1024))
+        return f"waiting for a {gb} GB GPU"
+    return "waiting for a matching node"
+
+
+async def db_now(session: AsyncSession) -> datetime:
+    value = await session.scalar(select(func.now()))
+    assert value is not None
+    return value
+
+
+async def load_job(session: AsyncSession, job_id: uuid.UUID, *, lock: bool = False) -> Job:
+    stmt: Select[tuple[Job]] = (
+        select(Job).where(Job.id == job_id).options(selectinload(Job.attempts))
+    )
+    if lock:
+        stmt = stmt.with_for_update()
+    job = await session.scalar(stmt)
+    if job is None:
+        raise AppError(404, "not_found", "job not found", job_id=str(job_id))
+    return job
+
+
+async def _active_attempt_for_node(session: AsyncSession, node_id: uuid.UUID) -> JobAttempt | None:
+    return await session.scalar(
+        select(JobAttempt).where(
+            JobAttempt.node_id == node_id,
+            JobAttempt.observed_state.in_(ACTIVE_ATTEMPT_STATES),
+        )
+    )
+
+
+async def _active_attempt_for_job(session: AsyncSession, job_id: uuid.UUID) -> JobAttempt | None:
+    return await session.scalar(
+        select(JobAttempt).where(
+            JobAttempt.job_id == job_id,
+            JobAttempt.observed_state.in_(ACTIVE_ATTEMPT_STATES),
+        )
+    )
+
+
+async def _quota_reason(session: AsyncSession, job: Job) -> str | None:
+    for subject_type, subject_id in (("user", job.user_id), ("project", job.project_id)):
+        quota = await session.scalar(
+            select(Quota).where(Quota.subject_type == subject_type, Quota.subject_id == subject_id)
+        )
+        limit = quota.max_concurrent_jobs if quota else (
+            settings.default_user_concurrency if subject_type == "user" else settings.default_project_concurrency
+        )
+        count = await session.scalar(
+            select(func.count())
+            .select_from(JobAttempt)
+            .join(Job, Job.id == JobAttempt.job_id)
+            .where(
+                JobAttempt.observed_state.in_(ACTIVE_ATTEMPT_STATES),
+                Job.user_id == job.user_id if subject_type == "user" else Job.project_id == job.project_id,
+            )
+        )
+        if int(count or 0) >= limit:
+            if subject_type == "user":
+                return "waiting for user concurrency slot"
+            return "waiting for project concurrency slot"
+    return None
+
+
+def _heartbeat_fresh(node: Node, now: datetime) -> bool:
+    if node.last_heartbeat_at is None:
+        return False
+    limit = timedelta(seconds=settings.heartbeat_interval_seconds * 3)
+    hb = node.last_heartbeat_at
+    if hb.tzinfo is None and now.tzinfo is not None:
+        hb = hb.replace(tzinfo=now.tzinfo)
+    return (now - hb) <= limit
+
+
+def is_train_node(node: Node) -> bool:
+    role = (getattr(node, "role", None) or "train").strip().lower()
+    return role != "build"
+
+
+def node_can_claim(node: Node, now: datetime) -> str | None:
+    if node.eligibility in {"draining", "quarantined"}:
+        return node.eligibility
+    if node.eligibility == "offline" or not _heartbeat_fresh(node, now):
+        return "offline"
+    if node.gpu_desktop_busy:
+        return "gpu_busy"
+    health = node.last_health if isinstance(node.last_health, dict) else {}
+    if health.get("agent_healthy") is False:
+        return "unhealthy"
+    if node.disk_free_bytes < settings.disk_watermark_bytes:
+        return "disk"
+    return None
+
+
+async def claim(session: AsyncSession, node: Node) -> JobAttempt | None:
+    now = await db_now(session)
+    if not is_train_node(node):
+        return None
+    existing = await _active_attempt_for_node(session, node.id)
+    if existing:
+        return existing
+    blocked = node_can_claim(node, now)
+    if blocked:
+        return None
+
+    stmt = (
+        select(Job)
+        .where(
+            Job.desired_state == "run",
+            Job.accepted_attempt_id.is_(None),
+        )
+        .order_by(Job.priority.desc(), Job.created_at.asc())
+        .with_for_update(skip_locked=True)
+    )
+    jobs = (await session.scalars(stmt)).all()
+    chosen: Job | None = None
+    for job in jobs:
+        if await _active_attempt_for_job(session, job.id):
+            continue
+        env = await session.get(Environment, job.environment_id)
+        if env is None or not env.cuda_preflight_ok:
+            continue
+        if (job.pending_reason or "") == "building environment":
+            continue
+        if not node_fits_job(node, job):
+            why = fit_failure(node, job)
+            if why == "class":
+                gpu_class = _resources(job).get("gpu_class")
+                job.pending_reason = f"waiting for node class {gpu_class}" if gpu_class else "waiting for a matching node"
+            elif why == "vram":
+                gb = max(1, round(_job_min_vram(job) / 1024))
+                job.pending_reason = f"waiting for a {gb} GB GPU"
+            else:
+                job.pending_reason = pending_reason_for(None, job)
+            continue
+        quota_reason = await _quota_reason(session, job)
+        if quota_reason:
+            job.pending_reason = quota_reason
+            continue
+        if reserved_skip(node, job, now, list(jobs)):
+            job.pending_reason = "waiting for a smaller GPU or high-VRAM reservation"
+            continue
+        chosen = job
+        break
+    if chosen is None:
+        return None
+
+    max_n = await session.scalar(
+        select(func.coalesce(func.max(JobAttempt.attempt_number), 0)).where(
+            JobAttempt.job_id == chosen.id
+        )
+    )
+    attempt_id = uuid.uuid4()
+    attempt = JobAttempt(
+        id=attempt_id,
+        job_id=chosen.id,
+        attempt_number=int(max_n or 0) + 1,
+        node_id=node.id,
+        fencing_token=uuid.uuid4(),
+        lease_expires_at=now + timedelta(seconds=settings.lease_ttl_seconds),
+        observed_state="leased",
+        output_namespace=f"jobs/{chosen.id}/attempts/{attempt_id}/",
+    )
+    chosen.pending_reason = pending_reason_for(node, chosen)
+    try:
+        async with session.begin_nested():
+            session.add(attempt)
+            await session.flush()
+        return attempt
+    except IntegrityError:
+        existing = await _active_attempt_for_node(session, node.id)
+        if existing:
+            return existing
+        raise
+
+
+async def explain_pending(session: AsyncSession, job: Job) -> str | None:
+    from app.status import derived_status
+
+    status = derived_status(job)
+    if status != "queued":
+        return job.pending_reason
+    now = await db_now(session)
+    nodes = (await session.scalars(select(Node))).all()
+    gpu_class = _resources(job).get("gpu_class")
+    class_nodes = [
+        n
+        for n in nodes
+        if is_train_node(n)
+        and n.eligibility != "quarantined"
+        and (not gpu_class or n.compatibility_class == gpu_class or (not settings.strict_node_class and n.gpu_model == gpu_class))
+    ]
+    if gpu_class and not class_nodes:
+        return f"waiting for node class {gpu_class}"
+    vram_ok = [n for n in class_nodes if fit_failure(n, job) != "vram"]
+    if _job_min_vram(job) and not vram_ok:
+        gb = max(1, round(_job_min_vram(job) / 1024))
+        return f"waiting for a {gb} GB GPU"
+    fitting = [n for n in class_nodes if node_fits_job(n, job)]
+    if fitting and all(n.disk_free_bytes < settings.disk_watermark_bytes for n in fitting):
+        return "waiting for disk on eligible nodes"
+    quota_reason = await _quota_reason(session, job)
+    if quota_reason:
+        return quota_reason
+    claimable = [n for n in fitting if node_can_claim(n, now) is None]
+    queued = (
+        await session.scalars(
+            select(Job).where(Job.desired_state == "run", Job.accepted_attempt_id.is_(None))
+        )
+    ).all()
+    if claimable and all(reserved_skip(n, job, now, list(queued)) for n in claimable):
+        return "waiting for a smaller GPU or high-VRAM reservation"
+    if job.pending_reason:
+        return job.pending_reason
+    return "waiting for a matching node"
+
+
+def _require_token(attempt: JobAttempt, token: uuid.UUID) -> None:
+    if attempt.fencing_token != token:
+        raise AppError(
+            409,
+            "fenced",
+            "stale fencing token",
+            job_id=str(attempt.job_id),
+            attempt_id=str(attempt.id),
+        )
+
+
+async def _get_attempt(session: AsyncSession, attempt_id: uuid.UUID) -> JobAttempt:
+    attempt = await session.scalar(
+        select(JobAttempt).where(JobAttempt.id == attempt_id).with_for_update()
+    )
+    if attempt is None:
+        raise AppError(404, "not_found", "attempt not found", attempt_id=str(attempt_id))
+    return attempt
+
+
+async def renew(
+    session: AsyncSession,
+    attempt_id: uuid.UUID,
+    token: uuid.UUID,
+    observed_state: str | None,
+    resource_usage: dict | None,
+) -> tuple[JobAttempt, Job]:
+    attempt = await _get_attempt(session, attempt_id)
+    _require_token(attempt, token)
+    job = await load_job(session, attempt.job_id, lock=True)
+    now = await db_now(session)
+
+    if attempt.observed_state in TERMINAL_ATTEMPT_STATES:
+        if job.accepted_attempt_id and job.accepted_attempt_id != attempt.id:
+            raise AppError(409, "fenced", "attempt superseded", job_id=str(job.id), attempt_id=str(attempt.id))
+        return attempt, job
+
+    if observed_state and observed_state != attempt.observed_state:
+        _apply_transition(attempt, observed_state, now)
+
+    if job.desired_state == "cancel" and attempt.observed_state in ACTIVE_ATTEMPT_STATES:
+        if attempt.observed_state != "cancelling":
+            attempt.observed_state = "cancelling"
+
+    if attempt.observed_state == "unknown" and observed_state in {"running", "starting", "uploading", "leased"}:
+        attempt.observed_state = observed_state
+
+    attempt.lease_expires_at = now + timedelta(seconds=settings.lease_ttl_seconds)
+    if resource_usage is not None:
+        attempt.resource_usage = resource_usage
+    return attempt, job
+
+
+def _apply_transition(attempt: JobAttempt, new_state: str, now: datetime) -> None:
+    current = attempt.observed_state
+    if current == new_state:
+        return
+    allowed = FORWARD_TRANSITIONS.get(current, set())
+    if new_state not in allowed:
+        raise AppError(
+            409,
+            "illegal_transition",
+            f"cannot move from {current} to {new_state}",
+            attempt_id=str(attempt.id),
+        )
+    attempt.observed_state = new_state
+    if new_state in {"starting", "running"} and attempt.started_at is None:
+        attempt.started_at = now
+    if new_state in TERMINAL_ATTEMPT_STATES:
+        attempt.completed_at = now
+
+
+async def on_event(
+    session: AsyncSession,
+    attempt_id: uuid.UUID,
+    token: uuid.UUID,
+    state: str,
+) -> JobAttempt:
+    attempt = await _get_attempt(session, attempt_id)
+    _require_token(attempt, token)
+    job = await load_job(session, attempt.job_id, lock=True)
+    if job.accepted_attempt_id and job.accepted_attempt_id != attempt.id:
+        raise AppError(409, "fenced", "attempt superseded", job_id=str(job.id), attempt_id=str(attempt.id))
+    now = await db_now(session)
+    if job.desired_state == "cancel" and state not in {"cancelling", "cancelled"}:
+        attempt.observed_state = "cancelling"
+        return attempt
+    _apply_transition(attempt, state, now)
+    return attempt
+
+
+async def request_cancel(session: AsyncSession, job_id: uuid.UUID) -> Job:
+    job = await load_job(session, job_id, lock=True)
+    if job.accepted_attempt_id:
+        accepted = next((a for a in job.attempts if a.id == job.accepted_attempt_id), None)
+        if accepted and accepted.observed_state == "completed":
+            raise AppError(409, "already_completed", "job already completed", job_id=str(job.id))
+    job.desired_state = "cancel"
+    attempt = await _active_attempt_for_job(session, job.id)
+    now = await db_now(session)
+    if attempt is None:
+        job.completed_at = now
+        job.pending_reason = None
+        return job
+    if attempt.observed_state not in TERMINAL_ATTEMPT_STATES:
+        attempt.observed_state = "cancelling"
+    return job
+
+
+async def _promote(session: AsyncSession, job: Job, attempt: JobAttempt, manifest: list[dict]) -> None:
+    for item in manifest:
+        relative = str(item["relative_path"]).lstrip("/")
+        src = f"{attempt.output_namespace}outputs/{relative}"
+        dst = f"jobs/{job.id}/promoted/{relative}"
+        if not storage.exists(src):
+            raise AppError(409, "missing_output", f"output object missing: {relative}", job_id=str(job.id))
+        expected = str(item.get("checksum_sha256") or "")
+        data = storage.get_bytes(src)
+        actual = __import__("hashlib").sha256(data).hexdigest()
+        if expected and actual != expected:
+            raise AppError(409, "checksum_mismatch", f"checksum mismatch for {relative}", job_id=str(job.id))
+        storage.copy(src, dst)
+        session.add(
+            Artifact(
+                job_id=job.id,
+                attempt_id=attempt.id,
+                type="output",
+                object_key=dst,
+                size_bytes=int(item.get("size_bytes") or len(data)),
+                checksum_sha256=actual,
+            )
+        )
+
+
+async def complete(
+    session: AsyncSession,
+    attempt_id: uuid.UUID,
+    token: uuid.UUID,
+    exit_code: int,
+    failure_category: str | None,
+    output_manifest: list[dict] | None,
+) -> dict[str, Any]:
+    attempt = await _get_attempt(session, attempt_id)
+    _require_token(attempt, token)
+    job = await load_job(session, attempt.job_id, lock=True)
+    now = await db_now(session)
+    manifest = output_manifest or []
+
+    if attempt.observed_state in TERMINAL_ATTEMPT_STATES:
+        payload = attempt.completion_payload or {}
+        if payload.get("exit_code") != exit_code:
+            raise AppError(
+                409,
+                "conflict",
+                "complete already accepted with a different exit code",
+                job_id=str(job.id),
+                attempt_id=str(attempt.id),
+            )
+        return payload
+
+    if job.accepted_attempt_id and job.accepted_attempt_id != attempt.id:
+        raise AppError(409, "fenced", "attempt superseded", job_id=str(job.id), attempt_id=str(attempt.id))
+
+    if job.desired_state == "cancel" and job.accepted_attempt_id is None:
+        attempt.observed_state = "cancelled"
+        attempt.failure_category = "cancelled"
+        attempt.exit_code = exit_code
+        attempt.completed_at = now
+        job.accepted_attempt_id = attempt.id
+        job.completed_at = now
+        job.pending_reason = None
+        payload = {
+            "accepted": False,
+            "status": "cancelled",
+            "error": "cancelled",
+            "exit_code": exit_code,
+            "attempt_id": str(attempt.id),
+            "job_id": str(job.id),
+        }
+        attempt.completion_payload = payload
+        return payload
+
+    if exit_code == 0 and not failure_category:
+        total = sum(int(item.get("size_bytes") or 0) for item in manifest)
+        too_big = any(int(item.get("size_bytes") or 0) > settings.output_file_bytes for item in manifest)
+        if total > settings.output_bytes_per_attempt or too_big:
+            failure_category = "resource"
+            exit_code = 1
+
+    if exit_code == 0 and not failure_category:
+        await _promote(session, job, attempt, manifest)
+        attempt.observed_state = "completed"
+        attempt.exit_code = 0
+        attempt.completed_at = now
+        job.accepted_attempt_id = attempt.id
+        job.completed_at = now
+        job.pending_reason = None
+        status = "completed"
+    else:
+        category = failure_category or "user_code"
+        attempt.observed_state = "failed" if category != "cancelled" else "cancelled"
+        attempt.failure_category = category
+        attempt.exit_code = exit_code
+        attempt.completed_at = now
+        retry = (
+            category in RETRYABLE_FAILURES
+            and job.desired_state == "run"
+            and attempt.attempt_number < job.max_attempts
+        )
+        if retry:
+            job.accepted_attempt_id = None
+            job.pending_reason = "retrying after node lost"
+            job.completed_at = None
+            status = "queued"
+        else:
+            job.accepted_attempt_id = attempt.id
+            job.completed_at = now
+            job.pending_reason = None
+            status = "failed" if attempt.observed_state == "failed" else "cancelled"
+
+    payload = {
+        "accepted": True,
+        "status": status,
+        "exit_code": exit_code,
+        "attempt_id": str(attempt.id),
+        "job_id": str(job.id),
+    }
+    attempt.completion_payload = payload
+    return payload
+
+
+async def expire_leases(session: AsyncSession) -> None:
+    now = await db_now(session)
+    attempts = (
+        await session.scalars(
+            select(JobAttempt)
+            .where(JobAttempt.observed_state.in_(ACTIVE_ATTEMPT_STATES))
+            .with_for_update()
+        )
+    ).all()
+    grace = timedelta(seconds=settings.disconnect_grace_seconds)
+    for attempt in attempts:
+        job = await load_job(session, attempt.job_id, lock=True)
+        if attempt.observed_state != "unknown" and now > attempt.lease_expires_at:
+            attempt.observed_state = "unknown"
+            continue
+        if attempt.observed_state == "unknown" and now > attempt.lease_expires_at + grace:
+            if job.desired_state == "cancel":
+                attempt.observed_state = "cancelled"
+                attempt.failure_category = "cancelled"
+                attempt.completed_at = now
+                job.accepted_attempt_id = attempt.id
+                job.completed_at = now
+                job.pending_reason = None
+                continue
+            await _fail_attempt(session, job, attempt, "lease_lost", now)
+
+
+async def _fail_attempt(
+    session: AsyncSession,
+    job: Job,
+    attempt: JobAttempt,
+    category: str,
+    now: datetime,
+) -> None:
+    if attempt.observed_state in TERMINAL_ATTEMPT_STATES:
+        return
+    attempt.observed_state = "failed"
+    attempt.failure_category = category
+    attempt.completed_at = now
+    retry = (
+        category in RETRYABLE_FAILURES
+        and job.desired_state == "run"
+        and attempt.attempt_number < job.max_attempts
+    )
+    if retry:
+        job.accepted_attempt_id = None
+        job.pending_reason = "retrying after node lost"
+        job.completed_at = None
+    else:
+        job.accepted_attempt_id = attempt.id
+        job.completed_at = now
+        job.pending_reason = None
+
+
+async def on_node_boot(session: AsyncSession, node_id: uuid.UUID) -> None:
+    now = await db_now(session)
+    attempts = (
+        await session.scalars(
+            select(JobAttempt).where(
+                JobAttempt.node_id == node_id,
+                JobAttempt.observed_state.in_(ACTIVE_ATTEMPT_STATES),
+            )
+        )
+    ).all()
+    for attempt in attempts:
+        job = await load_job(session, attempt.job_id, lock=True)
+        await _fail_attempt(session, job, attempt, "node_lost", now)
+
+
+async def mark_offline_nodes(session: AsyncSession) -> None:
+    now = await db_now(session)
+    nodes = (await session.scalars(select(Node))).all()
+    for node in nodes:
+        if node.eligibility in {"draining", "quarantined"}:
+            continue
+        if not _heartbeat_fresh(node, now):
+            node.eligibility = "offline"
+        elif node.eligibility == "offline":
+            node.eligibility = "eligible"
+
+
+async def claim_payload(session: AsyncSession, attempt: JobAttempt) -> dict[str, Any]:
+    job = await load_job(session, attempt.job_id)
+    env = await session.get(Environment, job.environment_id)
+    return {
+        "attempt_id": str(attempt.id),
+        "job_id": str(job.id),
+        "fencing_token": str(attempt.fencing_token),
+        "lease_expires_at": attempt.lease_expires_at.isoformat(),
+        "image_digest": env.image_digest if env else "sha256:dev",
+        "entrypoint": job.entrypoint,
+        "args": job.args,
+        "resources": job.resources,
+        "input": {
+            "artifact_id": str(job.submission_artifact_id) if job.submission_artifact_id else None,
+            "url": f"/attempts/{attempt.id}/input",
+        },
+        "output_namespace": attempt.output_namespace,
+        "log_upload": {"url": f"/attempts/{attempt.id}/logs"},
+        "max_runtime_seconds": job.max_runtime_seconds,
+    }

@@ -1,0 +1,7 @@
+{
+  "api_base": "http://192.168.68.118:8080",
+  "executor": "docker",
+  "compatibility_class": null,
+  "node_id": null,
+  "node_token": null
+}

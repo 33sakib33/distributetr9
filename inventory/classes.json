@@ -1,0 +1,58 @@
+{
+  "arch_markers": {
+    "ada": ["4090", "4080", "4070", "4060", "4050", "rtx 2000 ada", "rtx 4000 ada", "rtx 5000 ada"],
+    "ampere": ["3090", "3080", "3070", "3060", "3050", "a2000", "a4000", "a5000", "a6000"]
+  },
+  "classes": [
+    {
+      "name": "ada-24g",
+      "arch": "ada",
+      "min_vram_mb": 20480,
+      "max_vram_mb": 999999,
+      "meaning": "Ada, ~24 GB (4090 class)"
+    },
+    {
+      "name": "ada-16g",
+      "arch": "ada",
+      "min_vram_mb": 14336,
+      "max_vram_mb": 20479,
+      "meaning": "Ada, ~16 GB (4080 / 4070 Ti class)"
+    },
+    {
+      "name": "ada-12g",
+      "arch": "ada",
+      "min_vram_mb": 10240,
+      "max_vram_mb": 14335,
+      "meaning": "Ada, ~12 GB (4070 class)"
+    },
+    {
+      "name": "ada-8g",
+      "arch": "ada",
+      "min_vram_mb": 5120,
+      "max_vram_mb": 10239,
+      "meaning": "Ada, ~8 GB (4060 class)"
+    },
+    {
+      "name": "ampere-24g",
+      "arch": "ampere",
+      "min_vram_mb": 20480,
+      "max_vram_mb": 999999,
+      "meaning": "Ampere, ~24 GB (3090 class)"
+    },
+    {
+      "name": "ampere-12g",
+      "arch": "ampere",
+      "min_vram_mb": 10240,
+      "max_vram_mb": 20479,
+      "meaning": "Ampere, ~12 GB (3060 / 3080 class)"
+    },
+    {
+      "name": "ampere-8g",
+      "arch": "ampere",
+      "min_vram_mb": 5120,
+      "max_vram_mb": 10239,
+      "meaning": "Ampere, ~8 GB (3050 / 3070 8GB class)"
+    }
+  ],
+  "unsupported_meaning": "too old, unstable, unknown NVIDIA, or no supported VRAM band"
+}

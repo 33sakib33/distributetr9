@@ -1,0 +1,1 @@
+"""Fake-agent harness for scheduler protocol tests."""

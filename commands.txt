@@ -1,0 +1,2 @@
+LAB_IMAGE=python:3.12.7-slim \
+  python3 ./agent.py --api http://10.10.126.226:8080 --role train --executor docker

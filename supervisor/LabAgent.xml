@@ -1,0 +1,14 @@
+<service>
+  <id>LabMlAgent</id>
+  <name>Lab ML Agent</name>
+  <description>Starts the WSL lab agent at boot and restarts it on failure.</description>
+  <executable>powershell.exe</executable>
+  <arguments>-NoProfile -ExecutionPolicy Bypass -File "%BASE%\run-wsl-agent.ps1"</arguments>
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240000</sizeThreshold>
+    <keepFiles>4</keepFiles>
+  </log>
+</service>
