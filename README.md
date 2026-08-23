@@ -44,7 +44,24 @@ Open `http://127.0.0.1:3000`, click Sign in, enter your university email. Use `a
 
 ## Run an agent (this Mac or the other desktop)
 
-Copy the whole `agent/` folder (not only `agent.py`) to the other machine, then:
+On a Windows lab PC (WSL Ubuntu), one installer sets up Docker, `/etc/lab-agent`, and `/var/lab/attempts`. It does **not** start the agent at boot:
+
+```bash
+# inside WSL, from this repo (or scripts\setup-lab-node.cmd from Windows)
+sudo bash scripts/setup-lab-node.sh --api http://<mac-lan-ip>:8080
+# optional campus registry:
+# sudo bash scripts/setup-lab-node.sh --api http://<mac-lan-ip>:8080 --registry <mac-lan-ip>:5001
+# GPU nodes later: add --gpu
+```
+
+Then start it yourself:
+
+```bash
+lab-agent
+# or: bash /opt/lab-agent/run.sh
+```
+
+Manual start (no installer): copy the whole `agent/` folder, then:
 
 ```bash
 python3 agent/agent.py --api http://192.168.68.118:8080

@@ -2,6 +2,8 @@
 
 The control plane stays on the Mac. This folder is what you copy onto a **Windows lab PC** on the same Wi-Fi.
 
+**Preferred first install (no boot start):** from this repo in WSL, `sudo bash scripts/setup-lab-node.sh --api http://<mac-ip>:8080`. Or from Windows: `scripts\setup-lab-node.cmd --api http://<mac-ip>:8080`. Then start with `lab-agent`. Use the Scheduled Task below only when you want the agent after reboot.
+
 Agent process restart keeps `boot_session_id`. Restarting the WSL distro rotates the session and fences any in-flight attempt — that is correct.
 
 Canonical Windows path for these scripts: **`C:\lab\supervisor\`** (SYSTEM must still be able to read `run-wsl-agent.ps1` after reboot). The Python agent lives in WSL, typically `/opt/lab-agent` or `/home/<user>/distributetr9_node`.

@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # Start the lab agent from WSL. Prefer Docker via the docker group without a new login.
+# If LAB_API is unset, api_base from --config / /etc/lab-agent/config.json is used.
 set -u
 
-API="${LAB_API:-http://127.0.0.1:8080}"
 CONFIG="${LAB_CONFIG:-/etc/lab-agent/config.json}"
 EXECUTOR="${LAB_EXECUTOR:-auto}"
+
+extra_args=()
+if [ -n "${LAB_API:-}" ]; then
+  extra_args+=(--api "$LAB_API")
+fi
+if [ -n "${LAB_NODE_ROLE:-}" ]; then
+  extra_args+=(--role "$LAB_NODE_ROLE")
+fi
 
 resolve_dir() {
   if [ -n "${LAB_AGENT_DIR:-}" ] && [ -f "${LAB_AGENT_DIR}/agent.py" ]; then
@@ -53,12 +61,20 @@ start_docker
 
 run_agent() {
   local mode="$1"
-  exec python3 "$DIR/agent.py" --config "$CONFIG" --api "$API" --executor "$mode"
+  exec python3 "$DIR/agent.py" --config "$CONFIG" --executor "$mode" "${extra_args[@]}"
 }
 
 if command -v sg >/dev/null 2>&1 && in_docker_group; then
   if sg docker -c "docker info" >/dev/null 2>&1; then
-    exec sg docker -c "python3 '$DIR/agent.py' --config '$CONFIG' --api '$API' --executor docker"
+    api_q=""
+    role_q=""
+    if [ -n "${LAB_API:-}" ]; then
+      api_q=" --api '$LAB_API'"
+    fi
+    if [ -n "${LAB_NODE_ROLE:-}" ]; then
+      role_q=" --role '$LAB_NODE_ROLE'"
+    fi
+    exec sg docker -c "python3 '$DIR/agent.py' --config '$CONFIG' --executor docker${api_q}${role_q}"
   fi
 fi
 
