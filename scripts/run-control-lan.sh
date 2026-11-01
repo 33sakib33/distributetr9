@@ -37,8 +37,13 @@ export OIDC_REDIRECT_URI="${OIDC_REDIRECT_URI:-http://127.0.0.1:8080/auth/callba
 echo "LAN API: $PUBLIC_BASE_URL"
 echo "REGISTRY_URL: ${REGISTRY_URL:-unset (catalog images only)}"
 echo "Keep postgres+minio+registry in Docker: docker compose up -d postgres minio registry"
+# Reload only on code changes: agents write job files under .dev/, and a
+# reload must not wait forever on long-poll claims and live-log streams.
 exec "$ROOT/control/.venv/bin/uvicorn" app.main:app \
   --app-dir "$ROOT/control" \
   --host 0.0.0.0 \
   --port 8080 \
-  --reload
+  --reload \
+  --reload-dir "$ROOT/control" \
+  --reload-dir "$ROOT/agent" \
+  --timeout-graceful-shutdown 5
