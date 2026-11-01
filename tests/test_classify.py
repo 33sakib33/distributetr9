@@ -25,15 +25,24 @@ def test_ampere_vram_bands():
     assert classify_gpu("NVIDIA GeForce RTX 3070", 8192) == "ampere-8g"
 
 
+def test_turing_vram_bands():
+    assert classify_gpu("NVIDIA GeForce GTX 1660", 6144) == "turing-6g"
+    assert classify_gpu("NVIDIA GeForce GTX 1660 SUPER", 6144) == "turing-6g"
+    assert classify_gpu("NVIDIA GeForce RTX 2060", 6144) == "turing-6g"
+    assert classify_gpu("NVIDIA GeForce RTX 2070 SUPER", 8192) == "turing-8g"
+    assert classify_gpu("NVIDIA GeForce RTX 2080 Ti", 11264) == "turing-11g"
+
+
 def test_old_cards_unsupported():
     assert classify_gpu("NVIDIA GeForce GTX 1080 Ti", 11264) == "unsupported"
-    assert classify_gpu("NVIDIA GeForce RTX 2060", 6144) == "unsupported"
+    assert classify_gpu("NVIDIA GeForce GTX 1650", 4096) == "unsupported"
 
 
 def test_compute_capability_hints():
     assert infer_compute_capability("NVIDIA GeForce RTX 4070") == "8.9"
     assert infer_compute_capability("NVIDIA GeForce RTX 3080") == "8.6"
     assert infer_compute_capability("NVIDIA GeForce RTX 3050") == "8.6"
+    assert infer_compute_capability("NVIDIA GeForce GTX 1660") == "7.5"
 
 
 def test_docker_permission_hint():

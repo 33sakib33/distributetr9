@@ -137,6 +137,8 @@ def infer_compute_capability(gpu_model: str) -> str:
         return "8.6"
     if "a4000" in lowered or "a2000" in lowered:
         return "8.6"
+    if any(tok in lowered for tok in ("1660", "1650", "2060", "2070", "2080", "titan rtx", "quadro rtx", "t1000")):
+        return "7.5"
     return "0.0"
 
 

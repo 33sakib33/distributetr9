@@ -36,6 +36,16 @@ from app.storage import sha256_bytes, storage
 router = APIRouter()
 
 
+# Reasons the agent itself reported; they clear when it registers healthy again.
+_AUTO_REASONS = {"cuda preflight failed", "agent unhealthy", "unsupported GPU"}
+
+
+def _unhealthy_reason(body: RegisterIn) -> str:
+    if body.compatibility_class == "unsupported":
+        return "unsupported GPU"
+    return "cuda preflight failed"
+
+
 def _command_for(node: Node) -> str:
     if node.eligibility == "quarantined":
         return "quarantine"
@@ -74,7 +84,7 @@ async def register(
             role=body.role,
             update_ring=settings.default_update_ring,
             eligibility="eligible" if body.cuda_preflight_ok else "quarantined",
-            eligibility_reason=None if body.cuda_preflight_ok else "cuda preflight failed",
+            eligibility_reason=None if body.cuda_preflight_ok else _unhealthy_reason(body),
         )
         session.add(node)
         await session.flush()
@@ -115,11 +125,8 @@ async def register(
             pass
         elif not body.cuda_preflight_ok:
             node.eligibility = "quarantined"
-            node.eligibility_reason = "cuda preflight failed"
-        elif node.eligibility == "quarantined" and node.eligibility_reason in {
-            "cuda preflight failed",
-            "agent unhealthy",
-        }:
+            node.eligibility_reason = _unhealthy_reason(body)
+        elif node.eligibility == "quarantined" and node.eligibility_reason in _AUTO_REASONS:
             node.eligibility = "eligible"
             node.eligibility_reason = None
         elif node.eligibility not in {"quarantined"}:

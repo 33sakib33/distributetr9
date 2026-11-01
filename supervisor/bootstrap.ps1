@@ -271,6 +271,16 @@ while ((Get-Date) -lt $deadline) {
 if ($registered) {
     Write-Host $registered.Line
     Write-Host ""
+    if ($registered.Line -match "class unsupported") {
+        Write-Host "Registered, but this GPU is not in the supported class list, so the node is quarantined and gets no jobs." -ForegroundColor Yellow
+        Write-Host "Ask the lab admin to add its class to agent/classes.json; the agent picks it up on its next update." -ForegroundColor Yellow
+        exit 2
+    }
+    if ($registered.Line -match "healthy False") {
+        Write-Host "Registered, but the agent reports itself unhealthy (CUDA check failed), so the node is quarantined." -ForegroundColor Yellow
+        Write-Host "Check the Windows NVIDIA driver, then rerun this command." -ForegroundColor Yellow
+        exit 2
+    }
     Write-Host "Done. $env:COMPUTERNAME is a lab node. Reboot without logging in to confirm it comes back by itself." -ForegroundColor Green
 } else {
     Write-Host "The agent has not registered yet. Last log lines:" -ForegroundColor Yellow

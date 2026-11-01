@@ -26,7 +26,7 @@ except ImportError:
     from agent.executor import pick_mode, reconcile_lab_containers, run_docker, run_local_python, build_custom_image, is_registry_digest
     from agent import updater
 
-AGENT_VERSION = "0.7.0"
+AGENT_VERSION = "0.7.1"
 
 
 def load_config(path: Path | None) -> dict:

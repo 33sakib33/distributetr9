@@ -10,7 +10,16 @@ from app.config import settings
 from app.models import Environment, Quota, User
 
 PYTORCH_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
+# Compute capabilities the catalog images are built and tested for.
+CATALOG_GPU_ARCHS = ("8.9", "8.6", "7.5", "cpu")
 TENSORFLOW_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
+
+
+def _add_archs(env: Environment) -> None:
+    # Existing databases keep their rows; widen them when the catalog grows.
+    missing = [a for a in CATALOG_GPU_ARCHS if a not in (env.gpu_archs or [])]
+    if missing:
+        env.gpu_archs = list(env.gpu_archs or []) + missing
 
 
 async def seed(session: AsyncSession) -> None:
@@ -23,14 +32,16 @@ async def seed(session: AsyncSession) -> None:
                 framework="pytorch",
                 python_version="3.12",
                 cuda_version="12.4",
-                gpu_archs=["8.9", "8.6", "cpu"],
+                gpu_archs=list(CATALOG_GPU_ARCHS),
                 image_digest=PYTORCH_IMAGE,
                 lockfile=None,
                 cuda_preflight_ok=True,
             )
         )
-    elif pytorch.image_digest.startswith("sha256:dev"):
-        pytorch.image_digest = PYTORCH_IMAGE
+    else:
+        if pytorch.image_digest.startswith("sha256:dev"):
+            pytorch.image_digest = PYTORCH_IMAGE
+        _add_archs(pytorch)
 
     tensorflow = await session.get(Environment, TENSORFLOW_ID)
     if tensorflow is None:
@@ -41,14 +52,16 @@ async def seed(session: AsyncSession) -> None:
                 framework="tensorflow",
                 python_version="3.12",
                 cuda_version="12.4",
-                gpu_archs=["8.9", "8.6", "cpu"],
+                gpu_archs=list(CATALOG_GPU_ARCHS),
                 image_digest=TENSORFLOW_IMAGE,
                 lockfile=None,
                 cuda_preflight_ok=True,
             )
         )
-    elif tensorflow.image_digest.startswith("sha256:dev"):
-        tensorflow.image_digest = TENSORFLOW_IMAGE
+    else:
+        if tensorflow.image_digest.startswith("sha256:dev"):
+            tensorflow.image_digest = TENSORFLOW_IMAGE
+        _add_archs(tensorflow)
     await session.commit()
 
 

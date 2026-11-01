@@ -1,7 +1,35 @@
 {
   "arch_markers": {
-    "ada": ["4090", "4080", "4070", "4060", "4050", "rtx 2000 ada", "rtx 4000 ada", "rtx 5000 ada"],
-    "ampere": ["3090", "3080", "3070", "3060", "3050", "a2000", "a4000", "a5000", "a6000"]
+    "ada": [
+      "4090",
+      "4080",
+      "4070",
+      "4060",
+      "4050",
+      "rtx 2000 ada",
+      "rtx 4000 ada",
+      "rtx 5000 ada"
+    ],
+    "ampere": [
+      "3090",
+      "3080",
+      "3070",
+      "3060",
+      "3050",
+      "a2000",
+      "a4000",
+      "a5000",
+      "a6000"
+    ],
+    "turing": [
+      "1660",
+      "2060",
+      "2070",
+      "2080",
+      "titan rtx",
+      "quadro rtx",
+      "t1000"
+    ]
   },
   "classes": [
     {
@@ -52,6 +80,27 @@
       "min_vram_mb": 5120,
       "max_vram_mb": 10239,
       "meaning": "Ampere, ~8 GB (3050 / 3070 8GB class)"
+    },
+    {
+      "name": "turing-11g",
+      "arch": "turing",
+      "min_vram_mb": 10240,
+      "max_vram_mb": 999999,
+      "meaning": "Turing, 11 GB or more (2080 Ti / Titan RTX class)"
+    },
+    {
+      "name": "turing-8g",
+      "arch": "turing",
+      "min_vram_mb": 7168,
+      "max_vram_mb": 10239,
+      "meaning": "Turing, ~8 GB (2070 / 2080 class)"
+    },
+    {
+      "name": "turing-6g",
+      "arch": "turing",
+      "min_vram_mb": 5120,
+      "max_vram_mb": 7167,
+      "meaning": "Turing, ~6 GB (GTX 1660 / RTX 2060 class)"
     }
   ],
   "unsupported_meaning": "too old, unstable, unknown NVIDIA, or no supported VRAM band"

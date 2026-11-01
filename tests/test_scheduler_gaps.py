@@ -69,12 +69,12 @@ def test_disk_request_is_matched(client):
 
 
 def test_gpu_job_needs_supported_arch(client):
-    # The catalog PyTorch image lists 8.6 / 8.9; a 7.5 card is not supported.
+    # The catalog PyTorch image lists 8.9 / 8.6 / 7.5; a Pascal (6.1) card is not supported.
     tag = f"arch-{uuid.uuid4().hex[:8]}"
     portal = Portal(client)
     job = portal.submit_job(gpu_class=tag, min_vram_mb=4000)
-    turing = _agent(client, tag, "turing", cc="7.5")
-    assert turing.claim() is None
+    pascal = _agent(client, tag, "pascal", cc="6.1")
+    assert pascal.claim() is None
     assert portal.get_job(job["id"])["pending_reason"] == "waiting for a GPU this environment supports"
     ada = _agent(client, tag, "ada", cc="8.9")
     attempt = ada.claim()
@@ -146,3 +146,44 @@ def test_claim_rebuilds_environment_on_old_registry(client):
     assert portal.get_job(job["id"])["status"] == "building"
     rebuild = client.post("/agent/claim", json={}, headers=builder._headers()).json()["build"]
     assert rebuild["build_id"] == build["build_id"]
+
+
+def test_turing_node_runs_gpu_jobs_and_unsupported_gpu_is_named(client):
+    # Catalog images list 7.5, so a Turing card takes GPU jobs.
+    tag = "turing-6g"
+    portal = Portal(client)
+    job = portal.submit_job(gpu_class=tag, min_vram_mb=4000)
+    agent = FakeAgent(client, hostname=f"t-{uuid.uuid4().hex[:6]}", caps=_caps(tag, 6144, cc="7.5"))
+    agent.register()
+    agent.heartbeat()
+    attempt = agent.claim()
+    assert attempt is not None and attempt["job_id"] == job["id"]
+    agent.run_to_complete(attempt)
+
+    # A GPU outside the class list is quarantined with a reason that says so.
+    old = FakeAgent(client, hostname=f"u-{uuid.uuid4().hex[:6]}", caps=_caps("unsupported", 11264, cc="6.1"))
+    reg = client.post("/agent/register", json={**_register_body(old), "cuda_preflight_ok": False})
+    assert reg.status_code == 200
+    nodes = {n["id"]: n for n in client.get("/nodes", headers={"X-Dev-User": "admin@uni.edu"}).json()["nodes"]}
+    node = nodes[reg.json()["node_id"]]
+    assert (node["eligibility"], node["eligibility_reason"]) == ("quarantined", "unsupported GPU")
+
+
+def _register_body(agent: FakeAgent) -> dict:
+    return {
+        "node_id": None,
+        "hostname": agent.hostname,
+        "gpu_model": agent.caps["gpu_model"],
+        "compatibility_class": agent.caps["compatibility_class"],
+        "vram_total_mb": agent.caps["vram_total_mb"],
+        "vram_allocatable_mb": agent.caps["vram_allocatable_mb"],
+        "compute_capability": agent.caps.get("compute_capability", "0.0"),
+        "driver_version": "test",
+        "windows_version": "test",
+        "wsl_version": "test",
+        "agent_version": "harness-0.1",
+        "cpu_cores": 8,
+        "ram_mb": 16000,
+        "disk_free_bytes": 200_000_000_000,
+        "role": "train",
+    }
