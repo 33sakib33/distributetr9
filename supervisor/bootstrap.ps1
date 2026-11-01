@@ -58,6 +58,16 @@ function Invoke-Wsl([string[]]$Command) {
     if ($LASTEXITCODE -ne 0) { Fail "inside $Distro failed: $($Command -join ' ')" }
 }
 
+# Windows PowerShell 5.1 turns each stderr line of a redirected native program
+# into an error record, and with ErrorActionPreference=Stop the first one aborts
+# the script (e.g. docker's "Unable to find image ... locally"). Run such
+# commands with Continue and judge them by $LASTEXITCODE instead.
+function Invoke-Native([scriptblock]$Block) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $Block } finally { $ErrorActionPreference = $saved }
+}
+
 function ConvertTo-WslPath([string]$WindowsPath) {
     $full = [System.IO.Path]::GetFullPath($WindowsPath).Replace('\', '/')
     $out = & wsl.exe -d $Distro -u root --exec wslpath -a $full
@@ -97,10 +107,10 @@ Write-Host "  role        : $Role   GPU: $(if ($useGpu) { 'yes' } else { 'no' })
 Step "Checking WSL"
 # `wsl --version` exists only in the current (Store) WSL, which GPU passthrough
 # and systemd need. `wsl --update` moves an older inbox WSL onto it.
-& wsl.exe --version *> $null
+Invoke-Native { & wsl.exe --version *> $null }
 if ($LASTEXITCODE -ne 0) {
-    & wsl.exe --update *> $null
-    & wsl.exe --version *> $null
+    Invoke-Native { & wsl.exe --update *> $null }
+    Invoke-Native { & wsl.exe --version *> $null }
 }
 if ($LASTEXITCODE -ne 0) {
     & wsl.exe --install --no-distribution
@@ -108,7 +118,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "WSL has just been enabled. Reboot this PC, then run the same command again." -ForegroundColor Yellow
     exit 3010
 }
-& wsl.exe --update *> $null
+Invoke-Native { & wsl.exe --update *> $null }
 
 function Get-InstalledDistros {
     return @((& wsl.exe -l -q) -replace "`0", "" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -216,11 +226,15 @@ Step "Restarting WSL so the docker group takes effect"
 
 if ($useGpu) {
     Step "Checking the GPU from a container"
-    & wsl.exe -d $Distro -u $LinuxUser --exec docker run --rm --gpus all python:3.12.7-slim true *> $null
+    # The NVIDIA runtime injects nvidia-smi into any container started with --gpus.
+    $gpuOut = Invoke-Native { & wsl.exe -d $Distro -u $LinuxUser --exec docker run --rm --gpus all python:3.12.7-slim nvidia-smi -L 2>&1 }
+    $gpuLines = @($gpuOut | ForEach-Object { "$_" } | Where-Object { $_ -match "\S" })
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "GPU passthrough works."
+        Write-Host "GPU passthrough works:"
+        $gpuLines | Where-Object { $_ -match "^GPU " } | ForEach-Object { Write-Host "  $_" }
     } else {
-        Write-Host "GPU passthrough did not work yet. Check the Windows NVIDIA driver; the agent will report the node unhealthy until it does." -ForegroundColor Yellow
+        Write-Host "GPU passthrough did not work yet. Check the Windows NVIDIA driver; the agent reports the node unhealthy until it does." -ForegroundColor Yellow
+        $gpuLines | Select-Object -Last 8 | ForEach-Object { Write-Host "  $_" }
     }
 }
 
