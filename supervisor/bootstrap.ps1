@@ -31,6 +31,9 @@ param(
     [string]$Distro = "Ubuntu",
     [string]$LinuxUser = "lab",
     [string]$Root = "C:\lab",
+    # Ubuntu root filesystem to import when `wsl --install` cannot download one:
+    # a local .tar.gz (e.g. from a USB stick) or a URL. Default: Canonical's 24.04 image.
+    [string]$UbuntuImage = "",
     [switch]$ResetIdentity,
     [switch]$NoBootTask
 )
@@ -107,15 +110,57 @@ if ($LASTEXITCODE -ne 0) {
 }
 & wsl.exe --update *> $null
 
-$installed = @((& wsl.exe -l -q) -replace "`0", "" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-if ($installed -notcontains $Distro) {
+function Get-InstalledDistros {
+    return @((& wsl.exe -l -q) -replace "`0", "" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+# wsl --install needs Microsoft's distribution list from raw.githubusercontent.com.
+# When that is blocked, import Canonical's WSL image (or a local copy) instead.
+function Import-UbuntuImage {
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "amd64" }
+    $source = $UbuntuImage
+    if (-not $source) {
+        $source = "https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-$arch-wsl.rootfs.tar.gz"
+    }
+    if ($source -match "^https?://") {
+        $image = Join-Path $Root "ubuntu-wsl-$arch.rootfs.tar.gz"
+        if (-not (Test-Path $image)) {
+            Write-Host "Downloading $source (about 350 MB)"
+            & curl.exe -fL --retry 3 -o "$image.part" $source
+            if ($LASTEXITCODE -ne 0) {
+                Fail "could not download the Ubuntu image. Download it on another machine from $source, copy it here and rerun with -UbuntuImage <path>"
+            }
+            Move-Item "$image.part" $image -Force
+        }
+    } else {
+        if (-not (Test-Path $source)) { Fail "Ubuntu image not found: $source" }
+        $image = (Resolve-Path $source).Path
+    }
+    $target = Join-Path $Root "wsl\$Distro"
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Write-Host "Importing $image as $Distro (into $target)"
+    & wsl.exe --import $Distro $target $image --version 2
+    if ($LASTEXITCODE -ne 0) { Fail "wsl --import of $image failed" }
+}
+
+if ((Get-InstalledDistros) -notcontains $Distro) {
     Step "Installing $Distro"
-    & wsl.exe --install -d $Distro --no-launch
-    if ($LASTEXITCODE -ne 0) { Fail "wsl --install -d $Distro failed" }
-    # Initialise without the interactive first-run prompt; the user is created below.
-    $launcherName = ($Distro.ToLower() -replace "[-.]", "") + ".exe"
-    $launcher = Get-Command $launcherName -ErrorAction SilentlyContinue
-    if ($launcher) { & $launcher.Source install --root | Out-Null }
+    if (-not $UbuntuImage) {
+        & wsl.exe --install -d $Distro --no-launch
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "wsl --install failed; retrying with --web-download" -ForegroundColor Yellow
+            & wsl.exe --install -d $Distro --no-launch --web-download
+        }
+    }
+    if ((Get-InstalledDistros) -contains $Distro) {
+        # Initialise without the interactive first-run prompt; the user is created below.
+        $launcherName = ($Distro.ToLower() -replace "[-.]", "") + ".exe"
+        $launcher = Get-Command $launcherName -ErrorAction SilentlyContinue
+        if ($launcher) { & $launcher.Source install --root | Out-Null }
+    } else {
+        Write-Host "Microsoft's distribution list could not be fetched; importing Ubuntu directly." -ForegroundColor Yellow
+        Import-UbuntuImage
+    }
 }
 & wsl.exe -d $Distro -u root --exec true
 if ($LASTEXITCODE -ne 0) {
