@@ -1,0 +1,29 @@
+# HTTPS front door. LAB_TLS is "internal" (Caddy's own CA; install its root on
+# lab PCs with setup-lab-node.sh --ca-cert) or an email address for ACME.
+
+{$PORTAL_HOST} {
+	tls {$LAB_TLS}
+	encode gzip
+	reverse_proxy portal:3000
+}
+
+{$API_HOST} {
+	tls {$LAB_TLS}
+	# Live logs are SSE; never buffer them.
+	reverse_proxy control:8080 {
+		flush_interval -1
+	}
+}
+
+{$REGISTRY_HOST} {
+	tls {$LAB_TLS}
+	# Anyone on campus may pull; only the builder (docker login) may push.
+	@write not method GET HEAD
+	basic_auth @write {
+		{$REGISTRY_PUSH_USER} {$REGISTRY_PUSH_HASH}
+	}
+	request_body {
+		max_size 20GB
+	}
+	reverse_proxy registry:5000
+}
