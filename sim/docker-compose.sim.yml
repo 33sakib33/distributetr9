@@ -1,0 +1,112 @@
+# Simulated lab: a containerized control plane plus five lab PCs, each with its
+# own Docker daemon. Start with `make sim`, run the failure exam with
+# `make sim-exam`, stop with `make sim-down`. Paths are relative to the repo root.
+#
+# Uses its own database (lab_sim) and bucket (lab-sim); dev data is untouched.
+
+x-node: &node
+  build:
+    context: .
+    dockerfile: sim/node/Dockerfile
+  image: distributetr9-sim-node
+  profiles: ["sim"]
+  privileged: true
+  depends_on:
+    sim-control:
+      condition: service_healthy
+
+x-node-env: &node-env
+  LAB_API: http://sim-control:8080
+  SIM_REGISTRY: registry:5000
+
+services:
+  sim-control:
+    profiles: ["sim"]
+    build:
+      context: .
+      dockerfile: control/Dockerfile
+    image: distributetr9-control
+    container_name: sim-control
+    ports:
+      - "8090:8080"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-lab}:${POSTGRES_PASSWORD:-lab}@postgres:5432/lab_sim
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-labminio}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-labminio}
+      MINIO_BUCKET: lab-sim
+      MINIO_SECURE: "false"
+      REGISTRY_URL: registry:5000
+      DEV_AUTH: "1"
+      DEV_AUTH_ADMIN: "1"
+      OIDC_DEV: "1"
+      TOKEN_PEPPER: sim-token-pepper
+      AGENT_SIGNING_KEY_PATH: /data/agent-signing-key.pem
+      # Short timers so failures resolve in seconds, not minutes.
+      LEASE_TTL_SECONDS: "10"
+      HEARTBEAT_INTERVAL_SECONDS: "3"
+      DISCONNECT_GRACE_SECONDS: "8"
+      CLAIM_POLL_SECONDS: "5"
+      RUNTIME_GRACE_SECONDS: "5"
+      DEFAULT_USER_CONCURRENCY: "20"
+      DEFAULT_PROJECT_CONCURRENCY: "20"
+    volumes:
+      - simkeys:/data
+      - ./sim/control_entry.py:/app/control_entry.py:ro
+    command: ["python", "control_entry.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      registry:
+        condition: service_started
+
+  sim-pc-1:
+    <<: *node
+    container_name: sim-pc-1
+    hostname: sim-pc-1
+    environment:
+      <<: *node-env
+      LAB_FAKE_GPU: ampere-8g:8192:8.6
+      SIM_START_VERSION: "0.0.1"
+
+  sim-pc-2:
+    <<: *node
+    container_name: sim-pc-2
+    hostname: sim-pc-2
+    environment:
+      <<: *node-env
+      LAB_FAKE_GPU: ampere-8g:8192:8.6
+
+  sim-pc-3:
+    <<: *node
+    container_name: sim-pc-3
+    hostname: sim-pc-3
+    environment:
+      <<: *node-env
+      LAB_FAKE_GPU: ada-12g:12288:8.9
+
+  sim-pc-4:
+    <<: *node
+    container_name: sim-pc-4
+    hostname: sim-pc-4
+    environment:
+      <<: *node-env
+      LAB_FAKE_GPU: ada-24g:24576:8.9
+
+  sim-builder:
+    <<: *node
+    container_name: sim-builder
+    hostname: sim-builder
+    environment:
+      <<: *node-env
+      LAB_NODE_ROLE: build
+
+volumes:
+  simkeys:

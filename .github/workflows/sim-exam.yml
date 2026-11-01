@@ -1,0 +1,29 @@
+name: sim-exam
+
+# The simulated five-PC failure exam. Too slow for every push; runs nightly
+# and on demand from the Actions tab.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+jobs:
+  exam:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install httpx==0.28.1
+      - name: Start the simulated lab
+        run: docker compose -f docker-compose.yml -f sim/docker-compose.sim.yml --profile sim up -d --build --wait
+      - name: Failure exam
+        run: python -m sim.exam
+      - name: Node and control logs
+        if: failure()
+        run: |
+          for c in sim-control sim-pc-1 sim-pc-2 sim-pc-3 sim-pc-4 sim-builder; do
+            echo "::group::$c"; docker logs --tail 200 "$c" 2>&1; echo "::endgroup::"
+          done
