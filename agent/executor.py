@@ -2,14 +2,47 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 CPU_IMAGE = "python:3.12.7-slim"
 LINE_CB = Callable[[str], None]
+
+
+def _pump(proc: subprocess.Popen, on_line: LINE_CB, stop, deadline: float) -> str:
+    """Forward output until the process exits, `stop` is set, or the deadline
+    passes. Returns "exited", "stop" or "timeout".
+
+    Output is read on a thread: a job that trains silently must still be
+    cancellable and time-limited, which a blocking readline() would prevent.
+    """
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def reader() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.put(line.rstrip("\n"))
+        lines.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    while True:
+        if stop.is_set():
+            return "stop"
+        if time.time() > deadline:
+            return "timeout"
+        try:
+            line = lines.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if line is None:
+            proc.wait()
+            return "exited"
+        on_line(line)
 _REGISTRY_DIGEST = re.compile(r"^[^@\s]+/[^@\s]+@sha256:[0-9a-f]{64}$", re.IGNORECASE)
 
 
@@ -284,23 +317,18 @@ def run_docker(
     deadline = time.time() + max(1, int(timeout_seconds))
     category = None
     try:
-        while True:
-            if stop.is_set():
-                subprocess.run(["docker", "kill", "--signal", "SIGTERM", name], capture_output=True, timeout=10, check=False)
-                time.sleep(5)
-                subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=15, check=False)
-                proc.kill()
-                return 143, "cancelled"
-            line = proc.stdout.readline()
-            if line:
-                on_line(line.rstrip("\n"))
-            elif proc.poll() is not None:
-                break
-            if time.time() > deadline:
-                subprocess.run(["docker", "kill", name], capture_output=True, timeout=10, check=False)
-                subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=15, check=False)
-                proc.kill()
-                return 124, "timeout"
+        outcome = _pump(proc, on_line, stop, deadline)
+        if outcome == "stop":
+            subprocess.run(["docker", "kill", "--signal", "SIGTERM", name], capture_output=True, timeout=10, check=False)
+            time.sleep(5)
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=15, check=False)
+            proc.kill()
+            return 143, "cancelled"
+        if outcome == "timeout":
+            subprocess.run(["docker", "kill", name], capture_output=True, timeout=10, check=False)
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=15, check=False)
+            proc.kill()
+            return 124, "timeout"
         code = proc.wait()
         if code == 137:
             category = "resource"
@@ -335,23 +363,18 @@ def run_local_python(
     )
     assert proc.stdout is not None
     deadline = time.time() + max(1, int(timeout_seconds))
-    while True:
-        if stop.is_set():
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            return proc.returncode if proc.returncode is not None else 143, "cancelled"
-        line = proc.stdout.readline()
-        if line:
-            on_line(line.rstrip("\n"))
-        elif proc.poll() is not None:
-            break
-        if time.time() > deadline:
+    outcome = _pump(proc, on_line, stop, deadline)
+    if outcome == "stop":
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait()
-            return 124, "timeout"
+        return proc.returncode if proc.returncode is not None else 143, "cancelled"
+    if outcome == "timeout":
+        proc.kill()
+        proc.wait()
+        return 124, "timeout"
     code = proc.wait()
     if code == 0:
         return 0, None

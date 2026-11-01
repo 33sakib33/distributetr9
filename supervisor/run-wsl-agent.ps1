@@ -63,6 +63,11 @@ export LAB_API='__API__'
 export LAB_CONFIG='__CONFIG__'
 export LAB_AGENT_DIR='__DIR__'
 echo "user=$(id -un) uid=$(id -u) home=$HOME pwd=$(pwd) dir=$LAB_AGENT_DIR"
+if [ -x /usr/local/bin/lab-agent ] && [ -f /opt/lab-agent/launcher.sh ]; then
+  # Self-updating install: the launcher runs current/ and handles rollback.
+  unset LAB_AGENT_DIR
+  exec /usr/local/bin/lab-agent
+fi
 echo "--- ls dir ---"
 ls -la "$LAB_AGENT_DIR" 2>&1 || echo "cannot ls $LAB_AGENT_DIR"
 echo "--- ls dir/agent ---"

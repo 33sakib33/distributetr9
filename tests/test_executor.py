@@ -77,3 +77,46 @@ def test_gpu_flag_only_when_requested():
     cpu = _cmd(want_gpu=False)
     assert "--gpus" not in cpu
     assert "10000:10000" in cpu
+
+
+def _silent_job(tmp_path):
+    src = tmp_path / "in"
+    src.mkdir()
+    (src / "train.py").write_text("import time\nprint('working', flush=True)\ntime.sleep(60)\n")
+    return src
+
+
+def test_silent_job_still_times_out(tmp_path):
+    import sys
+    import threading
+    import time
+
+    from agent.executor import run_local_python
+
+    lines = []
+    start = time.time()
+    code, category = run_local_python(
+        python_bin=sys.executable, input_dir=_silent_job(tmp_path), output_dir=tmp_path / "out",
+        entrypoint="train.py", args=[], timeout_seconds=1, stop=threading.Event(), on_line=lines.append,
+    )
+    assert (code, category) == (124, "timeout")
+    assert time.time() - start < 5
+    assert lines == ["working"]
+
+
+def test_silent_job_can_be_cancelled(tmp_path):
+    import sys
+    import threading
+    import time
+
+    from agent.executor import run_local_python
+
+    stop = threading.Event()
+    threading.Timer(1.0, stop.set).start()
+    start = time.time()
+    _code, category = run_local_python(
+        python_bin=sys.executable, input_dir=_silent_job(tmp_path), output_dir=tmp_path / "out",
+        entrypoint="train.py", args=[], timeout_seconds=60, stop=stop, on_line=lambda _line: None,
+    )
+    assert category == "cancelled"
+    assert time.time() - start < 8

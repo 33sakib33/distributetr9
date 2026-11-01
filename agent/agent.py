@@ -20,11 +20,13 @@ from pathlib import Path
 try:
     from classify import agent_register_fields, disk_free_bytes, gpu_desktop_busy
     from executor import pick_mode, reconcile_lab_containers, run_docker, run_local_python, build_custom_image, is_registry_digest
+    import updater
 except ImportError:
     from agent.classify import agent_register_fields, disk_free_bytes, gpu_desktop_busy
     from agent.executor import pick_mode, reconcile_lab_containers, run_docker, run_local_python, build_custom_image, is_registry_digest
+    from agent import updater
 
-AGENT_VERSION = "0.6.1"
+AGENT_VERSION = "0.7.0"
 
 
 def load_config(path: Path | None) -> dict:
@@ -131,6 +133,7 @@ class Agent:
         attempt_root: Path | None = None,
         class_override: str | None = None,
         role: str = "train",
+        bundle_public_key: dict | None = None,
     ) -> None:
         self.api = api.rstrip("/")
         self.state_path = state_path
@@ -145,6 +148,12 @@ class Agent:
         self.state = {}
         if state_path.exists():
             self.state = json.loads(state_path.read_text())
+        # A key from the install config wins; otherwise the first key the
+        # server sends is pinned and never replaced (trust on first use).
+        if bundle_public_key:
+            self.state["bundle_public_key"] = bundle_public_key
+        self.release_root = updater.release_root()
+        self.update_backoff: dict[str, float] = {}
 
     def save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,7 +203,12 @@ class Agent:
         self.state["node_token"] = payload["node_token"]
         self.state["boot_session_id"] = payload["boot_session_id"]
         self.state["lease_ttl_seconds"] = payload.get("lease_ttl_seconds", 30)
+        if payload.get("bundle_public_key") and not self.state.get("bundle_public_key"):
+            self.state["bundle_public_key"] = payload["bundle_public_key"]
         self.save()
+        if updater.confirm_running(self.release_root, AGENT_VERSION):
+            print("release", AGENT_VERSION, "confirmed", flush=True)
+            updater.prune_releases(self.release_root)
         print(
             "registered node",
             self.state["node_id"],
@@ -245,6 +259,9 @@ class Agent:
                     print("heartbeat error", status, hb, flush=True)
                     time.sleep(3)
                     continue
+                update = (hb or {}).get("agent_update") if isinstance(hb, dict) else None
+                if update and self.maybe_update(update):
+                    sys.exit(updater.EXIT_UPDATED)
                 if not self.healthy:
                     print("unhealthy, not claiming", flush=True)
                     time.sleep(10)
@@ -473,6 +490,35 @@ class Agent:
             if work is not None:
                 shutil.rmtree(work, ignore_errors=True)
 
+    def maybe_update(self, update: dict) -> bool:
+        """Install a newer release between jobs. True means exit and restart."""
+        version = str(update.get("version") or "")
+        if time.time() < self.update_backoff.get(version, 0):
+            return False
+        if self.release_root is None:
+            print("update", version, "available; reinstall with setup-lab-node.sh to enable self-update", flush=True)
+            self.update_backoff[version] = time.time() + 3600
+            return False
+        key = self.state.get("bundle_public_key")
+        if not key:
+            print("update", version, "skipped: no pinned bundle key", flush=True)
+            self.update_backoff[version] = time.time() + 3600
+            return False
+
+        def fetch():
+            req = urllib.request.Request(self.api + update["url"], headers=self.headers())
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return resp.read(), resp.headers
+
+        try:
+            installed = updater.apply_update(fetch, update, key, self.release_root, AGENT_VERSION)
+        except (updater.UpdateError, OSError, urllib.error.URLError) as exc:
+            print("update", version, "failed:", exc, flush=True)
+            self.update_backoff[version] = time.time() + 600
+            return False
+        print("updated to", installed, "- restarting", flush=True)
+        return True
+
     def execute_build(self, build: dict) -> None:
         build_id = build["build_id"]
         print("claimed build", build_id, "tag", build.get("image_tag"), flush=True)
@@ -605,6 +651,7 @@ def main() -> None:
         attempt_root=Path(args.attempt_root) if args.attempt_root else None,
         class_override=cfg.get("compatibility_class"),
         role=role,
+        bundle_public_key=cfg.get("bundle_public_key"),
     ).run_forever()
 
 

@@ -15,11 +15,15 @@ ROLE="train"
 EXECUTOR="docker"
 WANT_GPU=0
 AGENT_SRC=""
+RESET_IDENTITY=0
+CA_CERT=""
 
 usage() {
   sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
   echo "Flags: --api URL  --registry HOST:PORT  --role train|build  --executor docker|auto"
-  echo "       --src DIR  --gpu  -h"
+  echo "       --src DIR  --gpu  --reset-identity  -h"
+  echo "  --reset-identity  forget this PC's node id (use before imaging a disk)"
+  echo "  --ca-cert FILE    trust the lab server's CA (deploy/ with LAB_TLS=internal)"
 }
 
 while [ $# -gt 0 ]; do
@@ -30,6 +34,8 @@ while [ $# -gt 0 ]; do
     --executor) EXECUTOR="${2:-}"; shift 2 ;;
     --src) AGENT_SRC="${2:-}"; shift 2 ;;
     --gpu) WANT_GPU=1; shift ;;
+    --reset-identity) RESET_IDENTITY=1; shift ;;
+    --ca-cert) CA_CERT="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -186,20 +192,72 @@ groupadd -f docker
 usermod -aG docker "$LAB_USER"
 start_docker
 
+# Docker must come up after every WSL boot with nobody logged in. With systemd
+# the docker unit does that; run.sh's `sudo -n service docker start` is the
+# fallback, allowed for exactly that one command.
+if is_wsl; then
+  touch /etc/wsl.conf
+  if ! grep -q '^\[boot\]' /etc/wsl.conf; then
+    printf '\n[boot]\nsystemd=true\n' >> /etc/wsl.conf
+    echo "enabled systemd in /etc/wsl.conf (takes effect after wsl --shutdown)"
+  fi
+fi
+SERVICE_BIN="$(command -v service || echo /usr/sbin/service)"
+echo "$LAB_USER ALL=(root) NOPASSWD: $SERVICE_BIN docker start" > /etc/sudoers.d/lab-agent
+chmod 440 /etc/sudoers.d/lab-agent
+if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/lab-agent >/dev/null; then
+  rm -f /etc/sudoers.d/lab-agent
+  echo "warning: could not add the docker-start sudo rule" >&2
+fi
+
 SRC="$(resolve_agent_src)"
 DEST=/opt/lab-agent
-echo "copy agent $SRC -> $DEST"
-install -d -m 755 -o "$LAB_USER" -g "$LAB_USER" "$DEST"
-cp -R "$SRC"/. "$DEST"/
+VERSION="$(sed -n 's/^AGENT_VERSION = "\(.*\)"/\1/p' "$SRC/agent.py")"
+[ -n "$VERSION" ] || { echo "cannot read AGENT_VERSION from $SRC/agent.py" >&2; exit 1; }
+# Release layout for self-update: releases/<version>, current -> that release.
+echo "install agent $VERSION: $SRC -> $DEST/releases/$VERSION"
+install -d -m 755 -o "$LAB_USER" -g "$LAB_USER" "$DEST" "$DEST/releases"
+rm -rf "$DEST/releases/$VERSION"
+mkdir -p "$DEST/releases/$VERSION"
+cp "$SRC"/*.py "$SRC"/*.json "$SRC"/*.sh "$DEST/releases/$VERSION"/ 2>/dev/null || true
+ln -sfn "releases/$VERSION" "$DEST/current"
+cp "$SRC/launcher.sh" "$DEST/launcher.sh"
+# Files from the old flat layout would shadow the release in older scripts.
+find "$DEST" -maxdepth 1 -type f \( -name '*.py' -o -name '*.json' -o -name 'run.sh' \) -delete
+rm -f "$DEST/pending" "$DEST/pending.fails" "$DEST/rejected"
 chown -R "$LAB_USER:$LAB_USER" "$DEST"
-chmod +x "$DEST/run.sh" 2>/dev/null || true
+chmod +x "$DEST/launcher.sh" "$DEST/releases/$VERSION"/*.sh
+
+if [ "$RESET_IDENTITY" -eq 1 ]; then
+  rm -f "$LAB_HOME/.distributetr9/agent-state.json"
+  echo "node identity reset; this PC registers as a new node on next start"
+fi
+
+if [ -n "$CA_CERT" ]; then
+  # Caddy's internal CA: trusted by the agent (system store) and by Docker for the registry.
+  install -m 644 "$CA_CERT" /usr/local/share/ca-certificates/lab-ca.crt
+  update-ca-certificates >/dev/null
+  if [ -n "$REGISTRY" ]; then
+    install -d /etc/docker/certs.d/"$REGISTRY"
+    install -m 644 "$CA_CERT" /etc/docker/certs.d/"$REGISTRY"/ca.crt
+  fi
+  echo "trusted lab CA from $CA_CERT"
+fi
+
+# Pin the update-signing key now, over the network the admin is watching.
+BUNDLE_KEY="$(curl -fsS -m 10 "${API%/}/agent/bundle-key" 2>/dev/null || true)"
+if [ -z "$BUNDLE_KEY" ]; then
+  echo "warning: could not fetch ${API%/}/agent/bundle-key; the agent will pin the key on first register"
+  BUNDLE_KEY="null"
+fi
 
 install -d -m 755 /etc/lab-agent
 cat > /etc/lab-agent/config.json <<EOF
 {
   "api_base": "${API}",
   "executor": "${EXECUTOR}",
-  "role": "${ROLE}"
+  "role": "${ROLE}",
+  "bundle_public_key": ${BUNDLE_KEY}
 }
 EOF
 chmod 644 /etc/lab-agent/config.json
@@ -207,7 +265,8 @@ chown root:root /etc/lab-agent /etc/lab-agent/config.json
 
 install -d -m 700 -o "$LAB_USER" -g "$LAB_USER" /var/lab/attempts
 
-if [ -n "$REGISTRY" ]; then
+if [ -n "$REGISTRY" ] && [ -z "$CA_CERT" ]; then
+  # Plain-HTTP dev registry. With --ca-cert the registry is HTTPS and trusted instead.
   merge_insecure_registry "$REGISTRY"
   service docker restart >/dev/null 2>&1 || start_docker
 fi
@@ -218,15 +277,13 @@ fi
 
 cat > /usr/local/bin/lab-agent <<'EOF'
 #!/usr/bin/env bash
-exec bash /opt/lab-agent/run.sh "$@"
+exec bash /opt/lab-agent/launcher.sh "$@"
 EOF
 chmod 755 /usr/local/bin/lab-agent
 
 echo
 echo "=== verify ==="
-if [ -f "$DEST/agent.py" ]; then
-  grep -E '^AGENT_VERSION' "$DEST/agent.py" || true
-fi
+echo "agent: $(readlink "$DEST/current")"
 echo "config:"
 cat /etc/lab-agent/config.json
 if sudo -u "$LAB_USER" test -w /var/lab/attempts; then
@@ -247,17 +304,19 @@ else
   echo "control API: not reachable yet (${API%/}/health) — check firewall / IP"
 fi
 if [ -n "$REGISTRY" ]; then
-  if curl -fsS -m 5 "http://${REGISTRY}/v2/" >/dev/null; then
-    echo "registry: reachable http://${REGISTRY}/v2/"
+  SCHEME=http
+  [ -n "$CA_CERT" ] && SCHEME=https
+  if curl -fsS -m 5 "${SCHEME}://${REGISTRY}/v2/" >/dev/null; then
+    echo "registry: reachable ${SCHEME}://${REGISTRY}/v2/"
   else
-    echo "registry: not reachable yet http://${REGISTRY}/v2/ — check insecure-registries / firewall"
+    echo "registry: not reachable yet ${SCHEME}://${REGISTRY}/v2/ — check certs / insecure-registries / firewall"
   fi
 fi
 
 echo
 echo "No boot service installed. Start when ready:"
 echo "  lab-agent"
-echo "  # or: bash /opt/lab-agent/run.sh"
+echo "  # updates itself from the control API; rolls back a release that will not start"
 if is_wsl; then
   echo
   echo "From Windows, once:  wsl --shutdown"

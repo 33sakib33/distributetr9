@@ -6,6 +6,8 @@ The control plane stays on the Mac. This folder is what you copy onto a **Window
 
 Agent process restart keeps `boot_session_id`. Restarting the WSL distro rotates the session and fences any in-flight attempt — that is correct.
 
+**Self-updating installs:** when `setup-lab-node.sh` has installed `/usr/local/bin/lab-agent` and `/opt/lab-agent/launcher.sh`, the scheduled task runs that launcher. It starts `/opt/lab-agent/current`, applies signed updates from the control plane, and rolls back a release that will not start. The manual copy steps below are only for machines without the installer.
+
 Canonical Windows path for these scripts: **`C:\lab\supervisor\`** (SYSTEM must still be able to read `run-wsl-agent.ps1` after reboot). The Python agent lives in WSL, typically `/opt/lab-agent` or `/home/<user>/distributetr9_node`.
 
 ## One-time install (admin PowerShell)

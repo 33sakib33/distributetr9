@@ -41,3 +41,20 @@ def test_docker_permission_hint():
     assert "usermod" in msg
     assert "sg docker" in msg
     assert format_docker_error("docker binary missing") == "docker binary missing"
+
+
+def test_fake_gpu_overrides_probe(monkeypatch, tmp_path):
+    from agent import classify
+
+    monkeypatch.setenv("LAB_FAKE_GPU", "ampere-8g:8192:8.6")
+    fields = classify.agent_register_fields(python_bin="python3")
+    assert fields["compatibility_class"] == "ampere-8g"
+    assert fields["vram_allocatable_mb"] == 8192
+    assert fields["compute_capability"] == "8.6"
+    assert fields["agent_healthy"] is True
+
+    busy = tmp_path / "busy"
+    monkeypatch.setenv("LAB_FAKE_BUSY_FILE", str(busy))
+    assert classify.gpu_desktop_busy() is False
+    busy.touch()
+    assert classify.gpu_desktop_busy() is True

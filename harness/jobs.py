@@ -46,6 +46,8 @@ class Portal:
         max_attempts: int | None = None,
         max_runtime_seconds: int = 120,
         requirements: str | None = None,
+        disk_mb: int | None = None,
+        idempotency_key: str | None = None,
     ) -> dict:
         project_id = self.ensure_project()
         data = {
@@ -58,13 +60,17 @@ class Portal:
                     "min_vram_mb": min_vram_mb,
                     "max_runtime_seconds": max_runtime_seconds,
                     "gpu_class": gpu_class,
+                    **({"disk_mb": disk_mb} if disk_mb else {}),
                 }
             ),
         }
         if requirements:
             data["requirements"] = requirements
         files = {"archive": ("hello.tar.gz", make_archive(), "application/gzip")}
-        resp = self.client.post("/jobs", data=data, files=files, headers=self.headers)
+        headers = dict(self.headers)
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        resp = self.client.post("/jobs", data=data, files=files, headers=headers)
         assert resp.status_code == 201, resp.text
         job = resp.json()
         if max_attempts is not None:

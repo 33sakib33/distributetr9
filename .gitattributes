@@ -1,0 +1,4 @@
+# Shell scripts run inside WSL and break with CRLF line endings.
+*.sh text eol=lf
+# Batch files misbehave with LF line endings.
+*.cmd text eol=crlf

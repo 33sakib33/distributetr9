@@ -46,11 +46,13 @@ class FakeAgent:
             "compatibility_class": self.caps["compatibility_class"],
             "vram_total_mb": self.caps["vram_total_mb"],
             "vram_allocatable_mb": self.caps["vram_allocatable_mb"],
-            "compute_capability": "8.9" if self.caps["vram_allocatable_mb"] else "0.0",
+            "compute_capability": self.caps.get(
+                "compute_capability", "8.9" if self.caps["vram_allocatable_mb"] else "0.0"
+            ),
             "driver_version": "test",
             "windows_version": "test",
             "wsl_version": "test",
-            "agent_version": "harness-0.1",
+            "agent_version": self.caps.get("agent_version", "harness-0.1"),
             "cpu_cores": 8,
             "ram_mb": 16000,
             "disk_free_bytes": 200_000_000_000,

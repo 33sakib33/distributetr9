@@ -173,6 +173,13 @@ def ram_mb() -> int:
 
 
 def disk_free_bytes(*targets: str) -> int:
+    # Simulated nodes: a file holding the free-byte count stands in for a full disk.
+    fake = os.environ.get("LAB_FAKE_DISK_FREE_FILE")
+    if fake and Path(fake).exists():
+        try:
+            return int(Path(fake).read_text().strip())
+        except ValueError:
+            pass
     paths = list(targets) or [str(Path.cwd()), "/"]
     if os.name == "nt":
         paths.append("C:\\")
@@ -203,9 +210,35 @@ def wsl_info() -> dict:
     }
 
 
+def fake_gpu() -> dict | None:
+    """LAB_FAKE_GPU=class:vram_mb[:cc] makes a GPU-less machine report a GPU.
+
+    For simulated lab nodes and scheduler testing only. Jobs still run on CPU,
+    because the executor adds --gpus only when nvidia-smi works.
+    """
+    raw = os.environ.get("LAB_FAKE_GPU", "").strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) < 2:
+        raise SystemExit("LAB_FAKE_GPU must be class:vram_mb[:compute_capability]")
+    vram = int(parts[1])
+    return {
+        "compatibility_class": parts[0],
+        "gpu_model": "fake " + parts[0],
+        "vram_total_mb": vram,
+        "vram_allocatable_mb": vram,
+        "compute_capability": parts[2] if len(parts) > 2 else "8.6",
+        "driver_version": "fake",
+    }
+
+
 def gpu_desktop_busy(*, has_lab_job: bool = False) -> bool:
     if has_lab_job:
         return False
+    busy_file = os.environ.get("LAB_FAKE_BUSY_FILE")
+    if busy_file:
+        return Path(busy_file).exists()
     util_raw = _run(
         ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"]
     )
@@ -299,7 +332,11 @@ def probe_machine(*, python_bin: str | None = None, cuda_test: bool = False) -> 
 
 
 def agent_register_fields(*, python_bin: str, cuda_test: bool = False) -> dict:
-    probed = probe_machine(python_bin=python_bin, cuda_test=cuda_test)
+    fake = fake_gpu()
+    probed = probe_machine(python_bin=python_bin, cuda_test=cuda_test and fake is None)
+    if fake:
+        probed.update(fake)
+        probed["pytorch_cuda_ok"] = True
     healthy = True
     if probed["compatibility_class"] not in {"cpu", "unsupported"} and cuda_test:
         healthy = bool(probed["pytorch_cuda_ok"])
