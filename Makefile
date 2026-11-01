@@ -1,4 +1,4 @@
-.PHONY: dev test lint migrate sim sim-down sim-exam
+.PHONY: dev test lint migrate sim sim-down sim-exam guide
 
 PY := control/.venv/bin/python
 
@@ -23,3 +23,6 @@ sim-down:
 
 sim-exam:
 	$(PY) -m sim.exam
+
+guide:
+	./docs/guide/build.sh

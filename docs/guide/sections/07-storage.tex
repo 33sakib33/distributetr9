@@ -1,0 +1,57 @@
+\section{Files: Object Storage with MinIO}
+
+\subsection{What object storage is}
+
+An object store keeps \emph{objects} (any bytes) under \emph{keys} (strings)
+inside \emph{buckets}. There are no real folders, no editing in place, and no
+file locking: you put a whole object, get it, or delete it. In exchange it is
+simple, scales to billions of objects, and every major cloud speaks the same
+protocol, Amazon S3's. MinIO is an open-source server that speaks S3, so the
+same code works on a laptop and against AWS.
+
+\begin{lstlisting}[language=Python]
+from minio import Minio
+client = Minio("127.0.0.1:9000", access_key="labminio",
+               secret_key="labminio", secure=False)
+client.put_object("lab", "jobs/7/promoted/model.pt", data, length)
+client.get_object("lab", "jobs/7/promoted/model.pt").read()
+\end{lstlisting}
+
+\subsection{Key layout}
+
+\begin{verbatim}
+submissions/<job>/input.tar.gz                  what the student uploaded
+jobs/<job>/attempts/<attempt>/logs/...          log chunks, per attempt
+jobs/<job>/attempts/<attempt>/outputs/<path>    uploads from one attempt
+jobs/<job>/promoted/<path>                      the accepted outputs
+builds/<build>/log.txt                          pip output of an env build
+\end{verbatim}
+
+Keys are designed so that cleanup is a prefix delete and so that two attempts
+can never overwrite each other.
+
+\subsection{Promote only after fencing}
+
+Outputs are uploaded under the \emph{attempt's} prefix. Only when
+\texttt{/complete} passes the fencing check does the server copy them to
+\texttt{promoted/}, after recomputing each file's SHA-256 and comparing it with
+the checksum the agent reported. A zombie attempt may upload whatever it likes;
+it lands under its own prefix and is never promoted. The same idea, ``write
+somewhere private, then publish atomically'', appears in database write-ahead
+logs, \texttt{git commit}, and blue/green deployments.
+
+\subsection{Limits}
+
+Each attempt has caps on log lines per second, total log bytes, file size and
+total output size. Excess log lines are dropped with a single warning line
+rather than failing the job; an oversized output fails the attempt with
+category \texttt{resource} and is not promoted. Limits are how a shared
+system survives one buggy script that prints a million lines a second.
+
+\subsection{Garbage collection}
+
+Nothing reads a failed attempt's outputs again.
+\verb|python -m app.ops gc --days 30| deletes the \texttt{attempts/} prefixes of attempts that were never
+accepted, and expires custom environment images no job has used recently. A
+test proves it deletes a lost attempt's partial file while keeping the
+promoted result.

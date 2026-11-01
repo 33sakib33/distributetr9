@@ -1,0 +1,107 @@
+\section{Containers, Images and the Registry}
+
+\subsection{Why every job runs in a container}
+
+A student's script is untrusted code on a shared PC. Running it directly
+would let it read other students' files, fill the disk, or install software
+that breaks the next job. A Docker container gives each attempt its own
+filesystem view, process tree and resource limits, and the whole thing is
+deleted afterwards.
+
+\subsection{The hardened docker run}
+
+\texttt{build\_docker\_run\_cmd()} in \texttt{agent/executor.py} builds this
+command (abridged):
+
+\begin{verbatim}
+docker run --name lab-<attempt>
+  --read-only                     root filesystem cannot be modified
+  --network none                  no internet, no LAN, no exfiltration
+  --pids-limit 512                fork bombs stop at 512 processes
+  --cpus 1 --memory 512m          cgroup limits from the job's request
+  --tmpfs /tmp:size=2g            scratch space in RAM, size-capped
+  -v <input>:/input:ro            the student's code, read-only
+  -v <output>:/output             the only writable place that is kept
+  --user 10000:10000              not root (CPU jobs)
+  --gpus all                      only when the job asked for VRAM
+  <image> python /input/train.py
+\end{verbatim}
+
+The function also refuses to build any command that mounts
+\texttt{docker.sock}: a container with the Docker socket can start a privileged
+container and take over the PC. Each flag closes one door; together they make
+a script able to compute and write results, and little else.
+
+\paragraph{Cgroups.} \verb|--cpus| and \verb|--memory| are enforced by
+Linux \emph{control groups}. A container over its memory limit is killed by the
+kernel (exit code 137), which the agent reports as category \texttt{resource}.
+
+\paragraph{GPUs in containers.} The NVIDIA Container Toolkit teaches Docker the
+\verb|--gpus| flag: it mounts the GPU device and the host driver's libraries
+into the container. Inside WSL2 the Windows driver is shared with Linux, which
+is why lab PCs install the NVIDIA driver on Windows only.
+
+\subsection{Tags and digests}
+
+An image name like \texttt{pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime} has
+a \emph{tag}, which is a movable label: the publisher can point it at a
+different image tomorrow. A \emph{digest} like
+\texttt{registry:5000/lab-env/1bf18b82@sha256:2f7e3116...} is the SHA-256 of the
+image manifest. Change one byte of the image and the digest changes, so pulling
+by digest always gives exactly the same bytes.
+
+The platform insists on digests for built environments: a build only counts
+as ready when the builder reports a \texttt{repo/name@sha256:...} reference from
+a registry. Two lab PCs running the same job therefore run the same software,
+and a rerun next month runs what ran today. This is \emph{content addressing},
+the same idea behind Git commit hashes and IPFS.
+
+\subsection{Custom environments}
+
+A student who needs \texttt{transformers==4.44.0} submits a
+\texttt{requirements.txt}. Building it on every PC would be slow and could give
+different results, so it is built \emph{once}:
+
+\begin{enumerate}
+\item The control plane normalises the requirements (sorted, lower-cased,
+  duplicates removed; no \texttt{-r} or \verb|--index-url|) and hashes them
+  together with the base image and GPU class:
+\begin{lstlisting}[language=Python]
+payload = {"requirements": reqs, "base": base_image, "compat": compat_class}
+env_hash = sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+\end{lstlisting}
+\item The same hash means the same environment. A second student with the same
+  requirements reuses the first student's image.
+\item A \emph{builder} node (\verb|--role build|) writes a Dockerfile
+  (\texttt{FROM base}, \texttt{RUN pip install -r requirements.txt}), builds it,
+  runs an import test (and a CUDA test for GPU classes), records
+  \texttt{pip freeze} as the lockfile, and pushes to the registry.
+\item Jobs wait in \texttt{building} until the push succeeds, then every node
+  pulls the image by digest.
+\end{enumerate}
+
+A broken \texttt{requirements.txt} fails on the builder in seconds, with the pip
+error in the build log, instead of failing on a GPU node after a long wait.
+
+\subsection{A bug: images tied to an old address}
+
+The hash ignores the registry's address. When the laptop running the registry
+changed Wi-Fi networks, its IP changed, but old builds still said ``ready'' with
+digests pointing at the old IP. New jobs reused them and every pull failed. The
+fix: when a ready build's digest names a different registry host than the
+current \texttt{REGISTRY\_URL}, the build is reset to \texttt{pending} and
+rebuilt, both at submit time and when a node claims. The lesson: when you cache
+by content hash, ask what is \emph{not} in the hash.
+
+\subsection{Docker-in-Docker for the simulated lab}
+
+The simulated lab runs five ``PCs'' as containers on one laptop. Each runs its
+\emph{own} Docker daemon inside (the \texttt{docker:dind} image, with
+\verb|--privileged|). That matters: each simulated PC has its own image cache,
+so a job on \texttt{sim-pc-3} really pulls from the registry like a separate
+machine would, instead of sharing the laptop's cache.
+
+\paragraph{Other use cases.} Container isolation is how GitHub Actions,
+Google Cloud Run, AWS Lambda and Kubernetes run code; digests are how
+Kubernetes and Helm pin exact images in production; build-once-pull-everywhere
+is how every CI/CD pipeline ships software.

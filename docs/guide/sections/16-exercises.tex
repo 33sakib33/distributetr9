@@ -1,0 +1,76 @@
+\section{Try It Yourself}
+
+Reading builds understanding; breaking things builds intuition. Each exercise
+takes ten to thirty minutes.
+
+\begin{enumerate}
+\item \textbf{Watch a lease expire.} Start \texttt{make dev}, submit a job with
+  \texttt{python3 scripts/smoke.py}, and while it runs kill the local agent
+  (\texttt{pkill -f agent.py}). Query the job every few seconds:
+  \texttt{curl -H "X-Dev-User: alice@uni.edu" localhost:8080/jobs/<id>}. Watch
+  the attempt go \texttt{running}, \texttt{unknown}, \texttt{failed
+  (lease\_lost)}, and a second attempt start.
+
+\item \textbf{Be a zombie.} In a Python shell, use \texttt{harness.client.FakeAgent}
+  to claim a job, let its lease expire, let a second fake agent complete it,
+  then call \texttt{complete} with the first agent's token. Read the
+  \texttt{409} body.
+
+\item \textbf{See SKIP LOCKED.} Open two \texttt{psql} sessions. In the first,
+  \texttt{BEGIN; SELECT id FROM jobs ... FOR UPDATE SKIP LOCKED LIMIT 1;} and
+  do not commit. In the second run the same query. Note which row each gets.
+  Now remove \texttt{SKIP LOCKED} from the second and see it wait.
+
+\item \textbf{Stream logs by hand.}
+  \texttt{curl -N -H "X-Dev-User: alice@uni.edu"
+  localhost:8080/jobs/<id>/logs/stream} shows raw SSE. Stop it, then rerun with
+  \texttt{-H "Last-Event-ID: 3"}.
+
+\item \textbf{Verify a signature by hand.} Fetch
+  \texttt{/agent/bundle-key} and \texttt{/agent/bundle} (with a node token),
+  then call \texttt{agent.updater.verify\_signature}. Flip one byte of the bundle
+  and verify again.
+
+\item \textbf{Break an update on purpose.} In the simulated lab, add
+  \texttt{raise SystemExit(1)} at the top of \texttt{agent/agent.py}, bump the
+  version, rebuild only \texttt{sim-control}, and watch the PCs update, fail
+  three times, roll back, and list the version in
+  \texttt{/opt/lab-agent/rejected}. Then revert.
+
+\item \textbf{Add a scenario to the exam.} Write a \texttt{sim/exam.py}
+  scenario that pauses a PC (\texttt{docker pause}) for longer than a lease and
+  checks what happens to its job. What should happen when it resumes?
+
+\item \textbf{Add a migration.} Add a nullable \texttt{notes} column to
+  \texttt{nodes}, autogenerate a migration, read it, run \texttt{make test}, and
+  confirm \texttt{alembic check} is clean.
+\end{enumerate}
+
+\subsection{Where these ideas show up next}
+
+\begin{description}
+\item[HTCondor] a decades-old system built for exactly this, scavenging idle
+  desktops for computation, with policies that respect the desktop's owner.
+\item[Slurm] the standard scheduler on university supercomputers; partitions,
+  QOS limits and GRES map to this project's classes and quotas.
+\item[Kubernetes] node labels, resource requests, leases for leader election,
+  rolling updates and readiness checks.
+\item[CI systems] GitHub Actions and GitLab runners pull jobs, run them in
+  containers, stream logs and upload artifacts, the same loop as this agent.
+\item[Render farms and BOINC] distributing independent work units to many
+  machines and validating the results.
+\item[Payment APIs] idempotency keys and exactly-once effects.
+\end{description}
+
+\subsection{Further reading}
+
+\begin{itemize}
+\item Martin Kleppmann, \emph{Designing Data-Intensive Applications}, chapters
+  on replication, transactions and ``the trouble with distributed systems''.
+\item Martin Kleppmann, ``How to do distributed locking'' (fencing tokens).
+\item The PostgreSQL manual, ``Explicit Locking'' and the \texttt{SELECT}
+  locking clauses.
+\item The Twelve-Factor App (\texttt{12factor.net}).
+\item Google, \emph{Site Reliability Engineering}, on alerting, runbooks and
+  release engineering.
+\end{itemize}

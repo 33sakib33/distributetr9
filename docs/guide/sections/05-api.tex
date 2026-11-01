@@ -1,0 +1,124 @@
+\section{The Control Plane API (FastAPI)}
+
+\subsection{Routers and two kinds of caller}
+
+The API has two audiences, split into separate router files:
+
+\begin{description}
+\item[Portal routes] (\texttt{routers/portal.py}) for people: submit jobs,
+  list them, stream logs, admin actions. Authenticated by a session cookie from
+  the university login, or the \texttt{X-Dev-User} header in development.
+\item[Agent routes] (\texttt{routers/agent.py}) for machines: register,
+  heartbeat, claim, renew, logs, outputs, complete. Authenticated by a
+  per-node bearer token.
+\end{description}
+
+\subsection{Dependency injection}
+
+FastAPI lets an endpoint declare what it needs as parameters, and builds those
+values before calling it. Authentication is written once as a dependency:
+
+\begin{lstlisting}[language=Python]
+# control/app/deps.py (simplified)
+async def get_current_node(
+    session: AsyncSession = Depends(get_session),
+    authorization: str | None = Header(default=None),
+    x_boot_session_id: str | None = Header(default=None,
+                                           alias="X-Boot-Session-Id"),
+) -> Node:
+    token = authorization.split(" ", 1)[1]
+    cred = await session.scalar(select(NodeCredential).where(
+        NodeCredential.token_hash == hash_token(token),
+        NodeCredential.revoked_at.is_(None)))
+    if cred is None:
+        raise AppError(401, "auth", "invalid node token")
+    node = await session.get(Node, cred.node_id)
+    if x_boot_session_id != node.boot_session_id:
+        raise AppError(409, "stale_boot_session", "re-register")
+    return node
+
+@router.post("/agent/heartbeat")
+async def heartbeat(body: HeartbeatIn,
+                    node: Node = Depends(get_current_node), ...):
+    ...  # only runs for an authenticated, current node
+\end{lstlisting}
+
+Every agent endpoint gets authentication, revocation and boot-session checks
+just by listing \texttt{node: Node = Depends(get\_current\_node)}.
+
+\paragraph{Request validation.} Request bodies are Pydantic models
+(\texttt{schemas.py}). A heartbeat with a missing field or a string where a
+number belongs is rejected with \texttt{422} before any code runs.
+
+\subsection{Long polling in code}
+
+\begin{lstlisting}[language=Python]
+@router.post("/agent/claim")
+async def claim_job(node: Node = Depends(get_current_node),
+                    session: AsyncSession = Depends(get_session)):
+    waited = 0.0
+    while True:
+        attempt = await claim(session, node)
+        if attempt:
+            payload = await claim_payload(session, attempt)
+            await session.commit()
+            return {"attempt": payload, "build": None}
+        await session.commit()          # release any locks while waiting
+        if waited >= settings.claim_poll_seconds:
+            return {"attempt": None, "build": None}
+        await asyncio.sleep(1.0)        # costs almost nothing in async code
+        waited += 1.0
+\end{lstlisting}
+
+The \texttt{commit()} before sleeping matters: holding a transaction open while
+asleep would hold locks and a database connection for no reason.
+
+\subsection{Live logs with Server-Sent Events}
+
+The student's browser shows log lines as they arrive. The portal uses
+\textbf{Server-Sent Events} (SSE): an ordinary HTTP response that never ends,
+where the server writes one small text block per event:
+
+\begin{verbatim}
+id: 42
+event: log
+data: {"seq": 42, "stream": "stdout", "line": "epoch 3 loss 0.41"}
+
+id: 43
+event: log
+data: {"seq": 43, "stream": "stdout", "line": "epoch 4 loss 0.37"}
+\end{verbatim}
+
+If the connection drops, the browser reconnects automatically and sends
+\texttt{Last-Event-ID: 43}; the server resumes after line 43. That only works
+because every log line has a sequence number, assigned by the agent and checked
+by the server (a chunk must start at \texttt{last\_log\_seq + 1}).
+
+\paragraph{SSE or WebSockets?} SSE is one-way (server to browser), plain HTTP,
+and reconnects by itself, which is all a log viewer needs. WebSockets are
+two-way, useful for chat or collaborative editing. Other SSE users: ChatGPT-style
+token streaming, stock tickers, build logs in CI dashboards.
+
+\subsection{Background workers}
+
+Two loops start with the app (\texttt{main.py}):
+
+\begin{itemize}
+\item The \textbf{lease worker}, every 2 seconds: expire leases and mark silent
+  nodes offline.
+\item The \textbf{alert worker}, every 60 seconds: compute alerts and post new
+  ones to a webhook.
+\end{itemize}
+
+They are \texttt{asyncio} tasks in the same process, created in FastAPI's
+\texttt{lifespan} hook and cancelled on shutdown. For one server that is enough;
+a larger system would move them to a separate worker process or a scheduler
+like Celery beat.
+
+\subsection{Errors as data}
+
+All expected failures raise \texttt{AppError(status, code, message)}, which a
+single handler turns into JSON like
+\texttt{\{"error": "fenced", "message": "stale fencing token"\}}. Clients
+branch on the stable \texttt{error} code, never on the human message. The agent,
+for example, re-registers when it sees \texttt{stale\_boot\_session}.

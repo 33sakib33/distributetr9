@@ -1,0 +1,142 @@
+\section{Self-Updating Agents}
+
+Updating sixty PCs by hand is not realistic. The agents update themselves, and
+the design has to answer three questions: how does a PC know the update is
+genuine, how does it switch without a broken half-state, and what if the new
+version does not work?
+
+\subsection{The flow}
+
+\begin{verbatim}
+ server                                    lab PC
+ ------                                    ------
+ packs agent/ into a tar.gz,
+ signs it with its private key
+                     heartbeat  <--------  agent 0.7.0
+ "agent_update: 0.7.1, sha256" -------->
+                     GET /agent/bundle <-- (only between jobs)
+ bundle + signature  --------------------> verify signature with pinned key
+                                           unpack to releases/0.7.1
+                                           write marker "pending"
+                                           switch current -> releases/0.7.1
+                                           exit 75
+                                           launcher restarts agent 0.7.1
+                     register   <--------  0.7.1 registers OK
+                                           delete "pending"  (confirmed)
+\end{verbatim}
+
+\subsection{Signatures: proving the bundle is genuine}
+
+Lab PCs may talk to the server over plain HTTP on campus Wi-Fi. Anyone who can
+intercept that traffic could otherwise serve a fake ``update'' and run code on
+every PC. So the server signs each bundle with an \textbf{RSA private key}, and
+each agent checks the signature with the matching \textbf{public key}, which it
+pinned when it was installed.
+
+\paragraph{How RSA signing works, in miniature.} The key holder has a modulus
+$n$, a public exponent $e$ (usually 65537) and a secret exponent $d$. To sign:
+hash the data with SHA-256, pad it to a standard shape, treat it as a number
+$m$, and compute $s = m^d \bmod n$. Anyone can verify by computing
+$s^e \bmod n$ and checking that the result equals the padded hash. Only the
+holder of $d$ can produce an $s$ that passes. Python's built-in three-argument
+\texttt{pow} does modular exponentiation, so verification needs no crypto
+library at all:
+
+\begin{lstlisting}[language=Python]
+# agent/updater.py
+def verify_signature(data: bytes, signature_hex: str, public_key: dict) -> bool:
+    n, e = int(public_key["n"], 16), int(public_key["e"])
+    sig = bytes.fromhex(signature_hex)
+    k = (n.bit_length() + 7) // 8                    # key size in bytes
+    if len(sig) != k:
+        return False
+    em = pow(int.from_bytes(sig, "big"), e, n).to_bytes(k, "big")
+    digest = SHA256_DIGEST_INFO + hashlib.sha256(data).digest()
+    expected = b"\x00\x01" + b"\xff" * (k - len(digest) - 3) + b"\x00" + digest
+    return hmac.compare_digest(em, expected)          # constant-time compare
+\end{lstlisting}
+
+The padding (\verb|00 01 FF FF ... FF 00| followed by an ASN.1 header that names
+SHA-256) is the PKCS\#1 v1.5 standard, so the server signs with the ordinary
+\texttt{cryptography} library and the agent verifies with ten lines of
+arithmetic. \texttt{hmac.compare\_digest} compares in constant time so the
+check does not leak information through timing.
+
+\paragraph{Why not an HMAC with the node token?} That was the first idea. But
+over plain HTTP the node token travels in every request header, so an attacker
+who can intercept traffic could compute the HMAC too. A public-key signature has
+no shared secret on the wire.
+
+\paragraph{Trust on first use.} The installer fetches the public key from
+\texttt{/agent/bundle-key} while an administrator is watching, and the agent
+also pins the first key a server sends if it has none. After that the key never
+changes silently. SSH host keys work the same way (``The authenticity of host
+\dots{} can't be established. Continue?'').
+
+\subsection{Atomic switching}
+
+\begin{verbatim}
+/opt/lab-agent/
+  releases/0.7.0/   agent.py ...
+  releases/0.7.1/   agent.py ...
+  current -> releases/0.7.1        (a symbolic link)
+  launcher.sh
+  pending                          (only while 0.7.1 is unproven)
+\end{verbatim}
+
+The new release is unpacked next to the old one, byte-compiled to catch syntax
+errors, and only then activated by replacing the \texttt{current} symlink:
+
+\begin{lstlisting}[language=Python]
+tmp = root / "current.new"
+tmp.symlink_to(Path("releases") / version)
+os.replace(tmp, root / "current")      # atomic rename on POSIX
+\end{lstlisting}
+
+\texttt{os.replace} is an atomic rename: anyone looking at \texttt{current}
+sees the old target or the new one, never a missing or half-written link. This
+is the same release layout Capistrano made popular for web deploys.
+
+\subsection{Rollback}
+
+Before switching, the updater writes a \texttt{pending} marker naming the new
+and previous versions. The new agent deletes it right after a successful
+registration. The launcher, a small bash loop that runs the agent, watches for
+the case where the agent keeps exiting while the marker is still there:
+
+\begin{lstlisting}[language=bash]
+while true; do
+  bash "$ROOT/current/run.sh"; code=$?
+  [ "$code" -eq 75 ] && continue            # updated: restart at once
+  if [ -f "$ROOT/pending" ]; then
+    fails=$((fails + 1))
+    if [ "$fails" -ge 3 ]; then             # new release cannot start
+      switch_current "$prev"                # roll back
+      echo "$bad" >> "$ROOT/rejected"       # never take it again
+    fi
+  fi
+  sleep 5
+done
+\end{lstlisting}
+
+The \texttt{rejected} list matters: without it, the server would keep offering
+the broken version and the PC would loop update, crash, rollback forever.
+
+\subsection{Rollout rings}
+
+Every node has an \texttt{update\_ring}: 0 for canary, 1 for an early group, 2
+for everyone. The server only offers an update to nodes whose ring is at most
+\texttt{AGENT\_ROLLOUT\_RING}. A release goes to one canary PC first, then a few,
+then all. \texttt{AGENT\_MIN\_VERSION} can additionally stop very old agents
+from taking work until they catch up.
+
+\paragraph{It worked on real hardware.} Bumping the agent from 0.7.0 to 0.7.1
+(the Turing support change) on the server was enough: the real Windows PC
+downloaded, verified and installed the update between jobs, re-registered with
+its new GPU class and left quarantine. In the simulated lab, all five PCs did
+the same in under a minute.
+
+\paragraph{Other use cases.} Chrome and Firefox updates, Android A/B system
+updates (two partitions, boot the new one, fall back if it fails), Kubernetes
+rolling updates with readiness checks, and feature-flag percentage rollouts
+all combine ``verify, switch atomically, watch, roll back''.

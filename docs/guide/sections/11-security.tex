@@ -1,0 +1,116 @@
+\section{Security}
+
+\subsection{Who is calling? Authentication}
+
+\begin{description}
+\item[Students and admins] sign in through the university's identity provider
+  using \textbf{OpenID Connect} (OIDC): the browser is sent to the campus login
+  page, the user signs in there, and the identity provider sends back a signed
+  token saying who they are. The platform never sees passwords. For
+  development a mock identity provider (\texttt{oidc\_dev.py}) accepts any
+  e-mail, and an \texttt{X-Dev-User} header skips login entirely.
+\item[Lab PCs] receive a random 32-byte token when they first register. The
+  server stores only a \emph{hash} of it:
+\end{description}
+
+\begin{lstlisting}[language=Python]
+# control/app/crypto.py
+def hash_token(token: str) -> str:
+    return hashlib.sha256(f"{settings.token_pepper}:{token}".encode()).hexdigest()
+\end{lstlisting}
+
+If the database leaks, the attacker gets hashes, not usable tokens. The
+\emph{pepper} is a server-side secret mixed into every hash, so the hashes are
+useless without it too. Revoking a stolen PC's token
+(\texttt{POST /nodes/<id>/revoke}) sets \texttt{revoked\_at}, and the
+authentication dependency rejects it from then on.
+
+\subsection{Refusing to run unsafely}
+
+Development defaults are convenient and dangerous: the dev header lets anyone
+be anyone. Rather than trusting a checklist, the API checks itself at startup
+when \texttt{ENVIRONMENT=production}:
+
+\begin{lstlisting}[language=Python]
+def production_problems(self) -> list[str]:
+    problems = []
+    if self.dev_auth:
+        problems.append("DEV_AUTH must be 0 (the X-Dev-User header ...)")
+    if len(self.token_pepper) < 24:
+        problems.append("TOKEN_PEPPER must be a random secret of 24+ chars")
+    if self.minio_secret_key in {"labminio", ""}:
+        problems.append("MINIO_SECRET_KEY is the dev default")
+    ...
+    return problems
+\end{lstlisting}
+
+With any problem present, startup fails with a list of exactly what to fix. A
+misconfigured server never comes up half-safe. This was tested by starting the
+production container with \texttt{DEV\_AUTH=1} and a short pepper; it refused
+and named both.
+
+\subsection{HTTPS with Caddy}
+
+In production, Caddy sits in front of everything as a reverse proxy and
+terminates TLS for three hostnames (portal, API, registry). Two certificate
+options:
+
+\begin{itemize}
+\item \textbf{ACME} (Let's Encrypt): real, publicly trusted certificates,
+  when the hostnames are reachable from the internet.
+\item \textbf{Internal CA} (\texttt{tls internal}): Caddy runs its own
+  certificate authority. Machines must be told to trust its root certificate
+  once; the lab PC installer's \verb|--ca-cert| flag does that for both the
+  agent and Docker.
+\end{itemize}
+
+\subsection{Read for everyone, write for one}
+
+Every PC must pull images; only the builder should push them. Caddy enforces
+that with HTTP methods alone:
+
+\begin{verbatim}
+{$REGISTRY_HOST} {
+    @write not method GET HEAD
+    basic_auth @write {
+        {$REGISTRY_PUSH_USER} {$REGISTRY_PUSH_HASH}
+    }
+    reverse_proxy registry:5000
+}
+\end{verbatim}
+
+Tested end to end: an anonymous pull returned 200, an anonymous push 401, and
+the builder's push 202.
+
+\subsection{Least privilege on the PC}
+
+The agent's Linux user may start the Docker daemon at boot, and nothing else as
+root. The installer adds exactly one sudo rule and verifies it with
+\texttt{visudo}:
+
+\begin{verbatim}
+lab ALL=(root) NOPASSWD: /usr/sbin/service docker start
+\end{verbatim}
+
+A test in a fresh Ubuntu container confirmed \texttt{sudo service docker start}
+works for that user and \texttt{sudo id} is refused.
+
+\subsection{Thinking like an attacker}
+
+A short threat model for this system:
+
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Threat} & \textbf{Defence} \\
+Student script reads others' data & container, read-only input, no network \\
+Script attacks the PC & non-root user, no docker.sock, cgroup limits \\
+Fake agent update over Wi-Fi & RSA signature, pinned public key \\
+Stolen PC replays its token & token revocation, hashed tokens \\
+Student impersonates another & OIDC login, dev header off in production \\
+Anyone pushes a malicious image & registry push requires credentials \\
+Database leak & only peppered token hashes stored \\
+\end{tabular}
+\end{center}
+
+Writing a table like this, even a rough one, is the first step of any security
+review (the formal versions are called STRIDE or attack trees).

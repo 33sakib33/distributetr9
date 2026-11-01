@@ -1,0 +1,202 @@
+\section{Distributed Systems Ideas}
+
+This chapter covers the ideas that make the platform correct when machines and
+networks fail. They are worth learning well: they appear in databases, job
+queues, payment systems and cloud schedulers.
+
+\subsection{Pull, not push}
+
+There are two ways to hand out work. In a \emph{push} design the server picks
+a worker and sends it the job. In a \emph{pull} design each worker asks for
+work when it is ready. distributetr9 pulls:
+
+\begin{lstlisting}[language=Python]
+# agent/agent.py (simplified)
+while True:
+    status, hb = self.heartbeat()          # "I am alive, here is my state"
+    status, payload = self.claim()         # "Any work for me?" (long poll)
+    attempt = payload.get("attempt")
+    if attempt:
+        self.execute(attempt)
+\end{lstlisting}
+
+Pulling suits lab PCs well:
+\begin{itemize}
+\item The server never needs to open a connection \emph{to} a PC. PCs sit
+  behind Windows firewalls and NAT; outgoing HTTP from the PC almost always
+  works.
+\item A busy, broken or rebooting PC simply stops asking. The server does not
+  need to track whether a push succeeded.
+\item The PC decides when it is ready, for example not while a student is
+  gaming on it (the \texttt{gpu\_desktop\_busy} check).
+\end{itemize}
+
+\paragraph{Long polling.} Asking every second wastes requests; asking every
+minute adds a minute of delay. A \emph{long poll} gets both: the agent asks,
+and the server holds the request open, checking once a second, until work
+appears or 25 seconds pass. The response comes back the moment a job fits.
+
+\paragraph{Other use cases.} GitHub Actions self-hosted runners, GitLab
+runners, Jenkins agents in ``inbound'' mode, Celery and Sidekiq workers pulling
+from a queue, and Amazon SQS long polling (\texttt{WaitTimeSeconds}) all pull.
+
+\subsection{Heartbeats}
+
+Every few seconds the agent sends \texttt{POST /agent/heartbeat} with its free
+disk space, whether the desktop GPU is busy, and whether it is healthy. The
+server records \texttt{last\_heartbeat\_at}. A background worker marks nodes
+whose heartbeat is older than three intervals as \texttt{offline}, and the
+scheduler skips them. The heartbeat \emph{response} carries commands back:
+\texttt{drain}, \texttt{quarantine}, or an available agent update. That gives
+the server a way to talk to PCs without ever connecting to them.
+
+\subsection{Leases}
+
+A lease is ownership with an expiry date. When a node claims a job it gets the
+attempt for 30 seconds. To keep it, the node must renew before time runs out.
+
+\begin{verbatim}
+ t=0s    claim       lease_expires_at = 30s
+ t=10s   renew       lease_expires_at = 40s
+ t=20s   renew       lease_expires_at = 50s
+ t=25s   PC loses power ...
+ t=50s   lease expires         -> attempt state: unknown
+ t=110s  + disconnect grace    -> failed (lease_lost), job re-queued
+\end{verbatim}
+
+Why not just wait for the PC to say it failed? Because a crashed PC cannot say
+anything. A lease turns ``silence'' into a decision the server can make on its
+own clock. The grace period avoids giving up on a PC that only missed a few
+renewals during a Wi-Fi hiccup.
+
+\paragraph{Other use cases.} DHCP leases your laptop an IP address; Kubernetes
+leader election uses Lease objects; distributed locks in etcd, ZooKeeper and
+Redis (Redlock) are leases; Amazon SQS's ``visibility timeout'' is a lease on a
+message.
+
+\subsection{Fencing tokens: rejecting zombies}
+
+Leases create a new problem. Picture this:
+
+\begin{enumerate}
+\item PC A claims job 7 and starts training.
+\item PC A's network drops for two minutes. Its lease expires.
+\item The server gives job 7 to PC B, which finishes and completes it.
+\item PC A's network returns. It finishes too and calls \texttt{/complete}.
+\end{enumerate}
+
+PC A is a \emph{zombie}: it believes it owns a job it lost long ago. If the
+server accepted its result, job 7 would have two results, or the wrong one.
+
+The fix is a \textbf{fencing token}. Each attempt gets a fresh random UUID when
+it is created. Every call that changes state must carry it, and the server
+compares it with the token stored on the attempt:
+
+\begin{lstlisting}[language=Python]
+# control/app/scheduler.py
+def _require_token(attempt: JobAttempt, token: uuid.UUID) -> None:
+    if attempt.fencing_token != token:
+        raise AppError(409, "fenced", "stale fencing token", ...)
+\end{lstlisting}
+
+PC A's attempt was failed when its lease expired, and job 7's accepted attempt
+is now PC B's. PC A's \texttt{/complete} hits the ``attempt superseded'' check
+and gets \texttt{409}. The zombie's work is discarded, never promoted. The
+simulated failure exam checks exactly this in its \texttt{network\_drop}
+scenario.
+
+\paragraph{Other use cases.} Martin Kleppmann's essay ``How to do distributed
+locking'' popularised the term. Apache Kafka uses producer epochs, HDFS uses
+generation stamps, and Raft and Paxos use terms and ballot numbers: all are
+fencing tokens.
+
+\subsection{Boot sessions}
+
+A PC that reboots gets a brand new agent process, but the same node identity.
+On registration the server issues a new \texttt{boot\_session\_id} and fails
+every attempt the node still owned (\texttt{on\_node\_boot}). Requests carrying
+an old boot session get \texttt{409 stale\_boot\_session}. This catches a case
+leases alone would only catch slowly: a PC that rebooted in ten seconds has
+certainly lost its running container, so there is no point waiting a full lease.
+
+\subsection{Idempotency: safe to repeat}
+
+Networks lose responses. If an agent sends \texttt{/complete} and the reply
+never arrives, it cannot know whether the server processed it. The only safe
+move is to send it again, so every state-changing call must be
+\textbf{idempotent}: doing it twice has the same effect as doing it once.
+
+\begin{itemize}
+\item \texttt{/complete} twice with the same token and exit code returns the
+  stored result. With a \emph{different} exit code it returns \texttt{409},
+  because that signals a real bug.
+\item \texttt{/claim} twice from the same node returns the node's existing
+  attempt instead of a second one.
+\item \texttt{POST /jobs} accepts an \texttt{Idempotency-Key} header. A browser
+  that retries a submit after a timeout gets the same job back instead of a
+  duplicate:
+\end{itemize}
+
+\begin{lstlisting}[language=Python]
+# control/app/routers/portal.py (simplified)
+if idem_key:
+    existing = await session.scalar(
+        select(Job.id).where(Job.user_id == user.id,
+                             Job.idempotency_key == idem_key))
+    if existing is not None:
+        return serialize_job(await load_job(session, existing))
+\end{lstlisting}
+
+A unique index on \texttt{(user\_id, idempotency\_key)} is the backstop: if two
+identical requests race past the check at the same moment, the second insert
+fails and the handler returns the job the first one created.
+
+\paragraph{Other use cases.} Stripe's API is the textbook example: every
+payment request takes an \texttt{Idempotency-Key} so a retried charge never
+bills twice. HTTP itself defines \texttt{PUT} and \texttt{DELETE} as idempotent.
+
+\subsection{At-least-once execution, exactly-once acceptance}
+
+Truly running something \emph{exactly once} across unreliable machines is
+impossible in general. What the platform guarantees instead is:
+
+\begin{itemize}
+\item A job may \emph{run} more than once (a zombie may keep training after it
+  was replaced). That is \emph{at-least-once execution}.
+\item Exactly one attempt's result is ever \emph{accepted and promoted}. That
+  is \emph{exactly-once acceptance}, enforced by fencing and a single
+  \texttt{accepted\_attempt\_id} column on the job.
+\end{itemize}
+
+Message queues make the same trade: Kafka and SQS deliver at least once, and
+consumers make processing idempotent to get an exactly-once \emph{effect}.
+
+\subsection{State machines}
+
+An attempt moves through named states, and only some moves are legal:
+
+\begin{verbatim}
+ leased -> starting -> running -> uploading -> completed
+    \          \          \          \
+     +----------+----------+----------+--> failed | cancelling -> cancelled
+                       any active state --> unknown (lease expired)
+                       unknown --> back to running (renewed in time) | failed
+\end{verbatim}
+
+\begin{lstlisting}[language=Python]
+# control/app/enums.py
+FORWARD_TRANSITIONS = {
+    "leased":    {"starting", "running", "uploading", "failed",
+                  "cancelling", "unknown"},
+    "running":   {"uploading", "failed", "cancelling", "unknown"},
+    "uploading": {"completed", "failed", "cancelling", "unknown"},
+    ...
+}
+\end{lstlisting}
+
+Writing transitions down as data means an impossible report, such as
+\texttt{completed} going back to \texttt{running}, becomes a clear
+\texttt{409 illegal\_transition} instead of silently corrupting state.
+
+\paragraph{Other use cases.} TCP connections, order fulfilment, CI pipelines,
+Kubernetes pod phases and AWS Step Functions are all explicit state machines.

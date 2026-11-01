@@ -1,0 +1,65 @@
+\section{Debugging Stories}
+
+Every bug below was real, found while building this project. Each one carries
+a lesson that applies far beyond it.
+
+\begin{description}
+\item[The image that disappeared.] One morning \texttt{docker compose up} failed:
+  \texttt{minio/minio} could no longer be pulled from Docker Hub. CI had passed
+  in August only because the image existed then.
+  \emph{Lesson:} external dependencies can vanish; pin images by digest and
+  have a fallback source.
+
+\item[Old builds, new address.] Ready environment images pointed at a registry
+  IP from a previous Wi-Fi network.
+  \emph{Lesson:} when caching by a content hash, list what is not in the hash.
+
+\item[The queue that looked empty.] Locking every queued job during a claim made
+  concurrent claims see nothing.
+  \emph{Lesson:} lock the smallest thing for the shortest time. Code that is
+  ``correct'' can still be wrong under concurrency, and only a concurrent test
+  shows it.
+
+\item[Cancel that did nothing.] A blocking \texttt{readline()} meant a quiet job
+  could not be cancelled or timed out.
+  \emph{Lesson:} a loop that must react to several things must never block on
+  one. Test with realistic inputs: real training jobs are quiet.
+
+\item[One disk-full failure that was not.] The \texttt{disk\_full} chaos
+  scenario failed with the wrong reason. The cause was the previous scenario's
+  stuck job (the readline bug) leaving the node unable to heartbeat.
+  \emph{Lesson:} when several tests fail, look for one root cause first.
+
+\item[Two event loops.] The operations tool called \texttt{asyncio.run()} twice
+  and reused pooled connections across loops.
+  \emph{Lesson:} async resources belong to the loop that made them.
+
+\item[A shadowed name.] In the same tool, a local variable \texttt{gc} (the
+  argument parser) hid the function \texttt{gc()}, failing with
+  ``\texttt{'ArgumentParser' object is not callable}''.
+  \emph{Lesson:} name variables after what they are (\texttt{gc\_cmd}), and run
+  the code path at least once in a test.
+
+\item[A false alarm.] A launcher test seemed to leave the API running. It had
+  simply been checked two seconds before its timeout fired.
+  \emph{Lesson:} before calling something a bug, check the timeline.
+
+\item[Every new dev user is an admin.] A test expected a student to get
+  \texttt{403} from an admin endpoint, but the test settings made every dev user
+  an admin.
+  \emph{Lesson:} when a test fails, question the test's assumptions as hard as
+  the code.
+
+\item[PowerShell 5.1's stderr.] Harmless Docker output aborted the Windows
+  setup script.
+  \emph{Lesson:} the version you test on matters; PowerShell 7 and 5.1 differ.
+
+\item[Blocked GitHub.] \verb|wsl --install| could not fetch its distribution
+  list on a campus network.
+  \emph{Lesson:} anything that downloads needs a second source.
+
+\item[An unknown GPU.] A GTX 1660 was quarantined as ``cuda preflight failed''
+  when the real reason was ``not in the class list''.
+  \emph{Lesson:} error messages should say the real reason; a misleading message
+  costs more time than the bug.
+\end{description}

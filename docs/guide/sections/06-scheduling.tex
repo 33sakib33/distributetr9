@@ -1,0 +1,111 @@
+\section{Scheduling: Which Job Goes Where}
+
+\subsection{Matching a job to a node}
+
+When a node claims, the scheduler walks the queue oldest first (higher priority
+first) and takes the first job the node can run. ``Can run'' is
+\texttt{fit\_failure()} in \texttt{scheduler.py}, which returns the first reason
+a job does \emph{not} fit, or \texttt{None}:
+
+\begin{lstlisting}[language=Python]
+def fit_failure(node, job, env=None) -> str | None:
+    res = job.resources
+    if res.get("gpu_class") and res["gpu_class"] != node.compatibility_class:
+        return "class"
+    if node.vram_allocatable_mb < res.get("min_vram_mb", 0):
+        return "vram"
+    if res.get("cpu_cores") and node.cpu_cores < res["cpu_cores"]:
+        return "cpu"
+    if res.get("ram_mb") and node.ram_mb < res["ram_mb"]:
+        return "ram"
+    archs = [a for a in (env.gpu_archs if env else []) if a != "cpu"]
+    if res.get("min_vram_mb") and archs and node_arch(node) not in archs:
+        return "env"      # image not built/tested for this GPU
+    if node.disk_free_bytes - watermark < res.get("disk_mb", 0) * 2**20:
+        return "disk"
+    return None
+\end{lstlisting}
+
+Returning a \emph{reason} instead of \texttt{True/False} pays off twice: the
+claim loop can skip quickly, and the portal can tell the student \emph{why} a
+job waits.
+
+\subsection{Pending reasons people can read}
+
+\texttt{explain\_pending()} runs when a student opens a job and produces one
+sentence such as:
+
+\begin{itemize}
+\item \texttt{waiting for node class ada-12g} (no such PC exists or is online)
+\item \texttt{waiting for a 12 GB GPU}
+\item \texttt{waiting for a GPU this environment supports}
+\item \texttt{waiting for disk on eligible nodes}
+\item \texttt{waiting for user concurrency slot}
+\item \texttt{waiting for a smaller GPU or high-VRAM reservation}
+\end{itemize}
+
+A queue that says ``pending'' with no reason generates support emails; a queue
+that explains itself does not.
+
+\subsection{Quotas}
+
+Each user and each project has a maximum number of running jobs (defaults 2
+and 4). Before taking a job the scheduler counts active attempts for that user
+and project. This keeps one student with 50 queued jobs from occupying every
+PC. Slurm calls this a QOS limit; Kubernetes calls it a ResourceQuota.
+
+\subsection{Reserving big GPUs, and aging}
+
+A 24 GB card is rare. If a small 4 GB job grabs it, a student needing 20 GB
+waits for no good reason. The rule, in \texttt{reserved\_skip()}:
+
+\begin{enumerate}
+\item On a high-VRAM node, a small job is skipped while any large job that fits
+  this node is waiting.
+\item With no large job waiting, a small job may still use the big card after
+  it has waited \texttt{aging\_steal\_seconds} (15 minutes). This is
+  \textbf{aging}: anything that waits long enough eventually wins, so nothing
+  starves forever.
+\end{enumerate}
+
+\begin{verbatim}
+Queue: [8 GB job (age 2 min)]     Idle: 12 GB node, 24 GB node
+  24 GB node claims -> skips (job is young, reserve the big card)
+  12 GB node claims -> takes it                        (test_scheduling.py)
+\end{verbatim}
+
+\subsection{GPU classes}
+
+Students do not know model names; they pick a class. The agent maps the GPU it
+detects with \texttt{nvidia-smi} to a class using \texttt{agent/classes.json}:
+
+\begin{lstlisting}[language=Python]
+# agent/classify.py (simplified)
+def classify_gpu(gpu_model: str | None, vram_mb: int) -> str:
+    if not gpu_model or gpu_model.lower() == "none":
+        return "cpu"
+    arch = arch_for(gpu_model)        # "rtx 3050" -> "ampere"
+    if not arch:
+        return "unsupported"          # quarantined until added
+    for row in catalog["classes"]:
+        if row["arch"] == arch and row["min_vram_mb"] <= vram_mb <= row["max_vram_mb"]:
+            return row["name"]        # e.g. "ampere-8g"
+    return "unsupported"
+\end{lstlisting}
+
+The architecture matters as much as the memory: CUDA code is compiled for
+specific \emph{compute capabilities} (8.9 for RTX 40xx ``Ada'', 8.6 for RTX 30xx
+``Ampere'', 7.5 for GTX 16xx and RTX 20xx ``Turing''). Each environment lists
+the capabilities it supports, and the scheduler only sends GPU jobs to nodes
+whose capability is on that list.
+
+\paragraph{A real case.} The first real Windows PC had a GTX 1660, which the
+original catalog did not know, so it registered as \texttt{unsupported} and was
+quarantined. Adding Turing meant three edits: new classes in
+\texttt{classes.json}, compute capability 7.5 in the catalog images' list, and
+an agent version bump. The PC then updated itself, re-registered as
+\texttt{turing-6g}, and left quarantine without anyone touching it.
+
+\paragraph{Other use cases.} Kubernetes node labels and \texttt{nodeSelector},
+Slurm partitions and GRES (``generic resources'' like \texttt{gpu:a100:2}),
+cloud instance types (\texttt{g5.xlarge}).

@@ -1,0 +1,87 @@
+\section{Reference}
+
+\subsection{Commands}
+
+\begin{verbatim}
+make dev                     local stack (API :8080, portal :3000)
+make test                    pytest against lab_test
+make lint                    ruff
+make sim / sim-exam / sim-down   simulated lab
+python3 scripts/smoke.py     submit a test job
+
+cd control && ../control/.venv/bin/alembic revision --autogenerate -m "..."
+cd control && ../control/.venv/bin/alembic upgrade head
+
+python -m app.ops status     node states, queue, alerts   (in control container)
+python -m app.ops gc --days 30 [--dry-run]
+
+deploy/backup.sh /srv/backups
+deploy/restore.sh /srv/backups/<timestamp>
+\end{verbatim}
+
+\subsection{Agent API (lab PCs)}
+
+\begin{center}
+\begin{tabular}{lll}
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+POST & /agent/register & get node id, token, boot session \\
+POST & /agent/heartbeat & health in, commands and updates out \\
+POST & /agent/claim & long poll for an attempt or a build \\
+POST & /attempts/\{id\}/renew & extend lease; learn about cancel \\
+POST & /attempts/\{id\}/logs & numbered log chunks \\
+PUT & /attempts/\{id\}/outputs/\{path\} & upload one output file \\
+POST & /attempts/\{id\}/complete & finish, with fencing token \\
+GET & /agent/bundle-key, /agent/bundle & signed self-update \\
+GET & /install/bootstrap.ps1 & one-command Windows setup \\
+\end{tabular}
+\end{center}
+
+\subsection{Portal and admin API}
+
+\begin{center}
+\begin{tabular}{lll}
+\textbf{Method} & \textbf{Path} & \textbf{Purpose} \\
+POST & /jobs & submit (multipart; optional Idempotency-Key) \\
+GET & /jobs/\{id\} & status with a readable pending reason \\
+GET & /jobs/\{id\}/logs/stream & live logs (SSE) \\
+POST & /jobs/\{id\}/cancel, /retry & control a job \\
+GET & /nodes, /admin/alerts & admin views \\
+POST & /nodes/\{id\}/drain, quarantine, release & node state \\
+POST & /nodes/\{id\}/ring, revoke & rollout ring, kill a token \\
+\end{tabular}
+\end{center}
+
+\subsection{Important settings}
+
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Variable} & \textbf{Meaning} \\
+ENVIRONMENT & \texttt{production} enables startup safety checks \\
+LEASE\_TTL\_SECONDS & lease length (30) \\
+DISCONNECT\_GRACE\_SECONDS & wait after expiry before failing (60) \\
+CLAIM\_POLL\_SECONDS & long-poll length (25) \\
+REGISTRY\_URL & registry host:port for custom environments \\
+AGENT\_ROLLOUT\_RING & 0 canary, 1 early, 2 everyone \\
+AGENT\_MIN\_VERSION & agents below this get no work \\
+ALERT\_WEBHOOK\_URL & where alerts are posted \\
+TOKEN\_PEPPER & secret mixed into token hashes \\
+\end{tabular}
+\end{center}
+
+\subsection{Glossary}
+
+\begin{description}
+\item[ACME] protocol for obtaining TLS certificates automatically (Let's Encrypt).
+\item[cgroup] Linux kernel feature that limits CPU, memory and processes.
+\item[Compute capability] NVIDIA's version number for a GPU architecture.
+\item[Digest] SHA-256 of an image manifest; an immutable image name.
+\item[Fencing token] value that lets a server reject a stale owner.
+\item[Idempotent] safe to repeat; repeating has no extra effect.
+\item[Lease] ownership that expires unless renewed.
+\item[Long poll] a request the server holds open until it has an answer.
+\item[OIDC] OpenID Connect, login delegated to an identity provider.
+\item[Pepper] server-side secret added to hashes.
+\item[SSE] Server-Sent Events, a one-way stream over HTTP.
+\item[TOFU] trust on first use; pin the first key seen.
+\item[WSL2] Linux kernel running inside Windows.
+\end{description}

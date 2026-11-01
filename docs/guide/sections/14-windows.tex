@@ -1,0 +1,91 @@
+\section{Windows, WSL and the One-Command Setup}
+
+\subsection{Why WSL}
+
+Lab PCs run Windows, but containers and NVIDIA's container tooling are Linux
+technologies. \textbf{WSL2} (Windows Subsystem for Linux) runs a real Linux
+kernel in a lightweight virtual machine, and NVIDIA's Windows driver exposes the
+GPU inside it. The agent and Docker Engine run in WSL Ubuntu; Windows only has
+to start WSL at boot.
+
+\subsection{Starting without anyone logging in}
+
+A Windows scheduled task (\texttt{supervisor/install.ps1}) runs at startup
+\emph{as the installing user} with the S4U logon type, meaning ``run as this
+user even when they are not logged in, without storing their password''.
+\texttt{SYSTEM} cannot start WSL2 on most PCs, which is why it is not used.
+Inside WSL, systemd starts Docker, and the launcher starts the agent.
+
+\subsection{The bootstrap script}
+
+\texttt{supervisor/bootstrap.ps1} turns a blank PC into a lab node with one
+command. The server serves it with its own address filled in:
+
+\begin{verbatim}
+powershell -ExecutionPolicy Bypass -Command
+  "& ([scriptblock]::Create((irm http://server:8080/install/bootstrap.ps1)))"
+\end{verbatim}
+
+\texttt{irm} downloads the script as text, \texttt{[scriptblock]::Create} turns
+the text into code, and \texttt{\&} runs it. It enables WSL, installs Ubuntu
+without the interactive first-run prompt, creates a \texttt{lab} user, downloads
+the install package, runs the Linux installer inside WSL, checks the GPU from a
+container, installs the boot task and waits until the PC registers.
+
+\subsection{Three lessons from the first real Windows PC}
+
+\paragraph{1. Quoting across two operating systems.} A command typed in
+PowerShell passes through PowerShell's parser, Windows' command-line rules, then
+the Linux shell inside WSL. Each layer has its own quoting. The script avoids
+the problem by never asking a shell to parse arguments:
+\verb|wsl.exe -d Ubuntu -u root --exec bash /mnt/c/lab/wsl-prep.sh lab|.
+\verb|--exec| runs the program directly with plain arguments, and anything
+complicated goes into a script file written with Unix line endings.
+
+\paragraph{2. Windows PowerShell 5.1 and stderr.} The first run stopped at the
+GPU check with ``Unable to find image python:3.12.7-slim locally''. That message
+is harmless: Docker prints it to stderr just before downloading. But in Windows
+PowerShell 5.1, when a native program's output is redirected, each stderr line
+becomes an \emph{error record}, and the script used
+\texttt{\$ErrorActionPreference = "Stop"}, so the first stderr line aborted
+everything. PowerShell 7 behaves differently, which is why the test container
+did not catch it. The fix runs those commands with errors non-fatal and judges
+them by exit code:
+
+\begin{lstlisting}[language=powershell]
+function Invoke-Native([scriptblock]$Block) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $Block } finally { $ErrorActionPreference = $saved }
+}
+$out = Invoke-Native { & wsl.exe -d Ubuntu --exec docker run --rm `
+                         --gpus all python:3.12.7-slim nvidia-smi -L 2>&1 }
+if ($LASTEXITCODE -eq 0) { "GPU passthrough works" }
+\end{lstlisting}
+
+\paragraph{3. Networks that block GitHub.} \verb|wsl --install -d Ubuntu|
+first downloads Microsoft's list of distributions from
+\texttt{raw.githubusercontent.com}. On the lab PC's network that failed. The
+bootstrap now falls back to \verb|--web-download|, then to importing
+Canonical's official WSL image from \texttt{cloud-images.ubuntu.com}, or a file
+brought on a USB stick:
+
+\begin{verbatim}
+wsl --import Ubuntu C:\lab\wsl\Ubuntu ubuntu-noble-wsl-amd64.rootfs.tar.gz
+\end{verbatim}
+
+\subsection{Line endings}
+
+Windows uses CRLF (\verb|\r\n|) at the end of lines; Linux uses LF
+(\verb|\n|). A bash script with CRLF fails with confusing errors like
+\verb|$'\r': command not found|. Git for Windows converts line endings on
+checkout by default, so a repository cloned on Windows could break every shell
+script. A \texttt{.gitattributes} file fixes it for good:
+
+\begin{verbatim}
+*.sh  text eol=lf      # always LF, whatever the OS
+*.cmd text eol=crlf    # batch files want CRLF
+\end{verbatim}
+
+The server also strips CR from scripts when it builds the install package,
+belt and braces.

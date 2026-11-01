@@ -1,0 +1,45 @@
+\documentclass[11pt]{article}
+
+\title{Building a GPU Job Platform from Lab PCs\\
+A Technical Guide to distributetr9}
+\author{Written alongside the code, November 2026}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This guide explains how distributetr9 works and why it is built the way it
+is. distributetr9 turns a room of ordinary Windows PCs with consumer GPUs into
+a shared cluster: students submit a Python training script in a web portal, an
+idle lab PC runs it inside a Docker container, and the logs and outputs come
+back to the student. Along the way the project touches most of the ideas behind
+real distributed systems: leases, fencing tokens, idempotency, database
+locking, containers, image registries, signed software updates, HTTPS, chaos
+testing and operations. Each chapter introduces one idea with a small example
+you can run or picture, shows where it lives in this repository, and lists
+other places the same idea shows up in industry. The final chapters retell the
+real bugs found while building the project, because debugging stories teach
+more than finished code does.
+\end{abstract}
+
+\input{sections/01-overview}
+\input{sections/02-repository}
+\input{sections/03-distributed}
+\input{sections/04-database}
+\input{sections/05-api}
+\input{sections/06-scheduling}
+\input{sections/07-storage}
+\input{sections/08-containers}
+\input{sections/09-agent}
+\input{sections/10-self-update}
+\input{sections/11-security}
+\input{sections/12-testing}
+\input{sections/13-operations}
+\input{sections/14-windows}
+\input{sections/15-lessons}
+\input{sections/16-exercises}
+\input{sections/17-reference}
+
+\end{document}

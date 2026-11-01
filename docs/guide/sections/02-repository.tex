@@ -1,0 +1,92 @@
+\section{How the Repository Is Organised}
+
+\begin{verbatim}
+distributetr9/
+  control/                FastAPI control plane
+    app/
+      main.py             app startup, background workers
+      config.py           every setting, read from environment variables
+      models.py           SQLAlchemy tables
+      db.py               engine, sessions, migrations on startup
+      scheduler.py        claim, renew, complete, lease expiry
+      envbuild.py         custom environment builds
+      agent_bundle.py     signed agent updates, install package
+      alerts.py ops.py    operations: alerts, garbage collection
+      routers/            HTTP endpoints: portal.py, agent.py, auth.py
+    migrations/           Alembic schema migrations
+  agent/                  runs on each lab PC (Python standard library only)
+    agent.py              main loop: register, heartbeat, claim, run
+    executor.py           docker run / local python, log pumping
+    classify.py           GPU detection and class mapping
+    updater.py            verify and install signed updates
+    launcher.sh run.sh    process supervision and rollback
+    classes.json          GPU class catalog
+  portal/                 Next.js web UI
+  harness/                fake agents for tests and load testing
+  tests/                  pytest suite (runs against real Postgres + MinIO)
+  sim/                    simulated five-PC lab + failure exam
+  deploy/                 production compose, Caddy, backup, restore
+  scripts/                dev launcher, lab PC installer, smoke test
+  supervisor/             Windows boot task and one-command bootstrap
+  spec/                   the design specification (14 modules, 12 phases)
+  docs/                   runbooks, registry notes, this guide
+\end{verbatim}
+
+\subsection{Why this split}
+
+Each directory matches one \emph{deployable thing} or one \emph{audience}:
+
+\begin{itemize}
+\item \texttt{control/} and \texttt{portal/} run on the server.
+\item \texttt{agent/}, \texttt{supervisor/} and the installer run on lab PCs.
+  The agent deliberately uses only the Python standard library, so installing
+  it means copying files, and updating it means copying newer files. There is
+  no \texttt{pip install} on sixty machines that might each fail differently.
+\item \texttt{harness/}, \texttt{tests/} and \texttt{sim/} exist only to
+  prove the other parts work.
+\item \texttt{spec/} was written before the code. It froze the scope of version
+  1 and split the work into phases, each ending with a \emph{gate}: a concrete
+  demonstration that must pass before the next phase starts.
+\end{itemize}
+
+\subsection{Configuration: one settings object}
+
+Every tunable value lives in \texttt{control/app/config.py} as a field on a
+\texttt{pydantic-settings} class. Pydantic reads each field from an environment
+variable of the same name (case-insensitive), falling back to a
+\texttt{.env} file and then to the default:
+
+\begin{lstlisting}[language=Python]
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    lease_ttl_seconds: int = 30
+    claim_poll_seconds: int = 25
+    agent_rollout_ring: int = 2
+
+settings = Settings()   # LEASE_TTL_SECONDS=10 in the environment wins
+\end{lstlisting}
+
+The benefit is that tests, the simulated lab and production run the same code
+with different numbers. The simulated lab, for example, sets a 10 second lease
+so that failure scenarios resolve in seconds rather than minutes.
+
+\paragraph{Other use cases.} This is the ``config in the environment'' rule of
+the Twelve-Factor App methodology, used by most containerised services. The
+same pattern appears in Django (\texttt{django-environ}), Spring Boot
+(\texttt{application.properties} overridden by environment variables) and
+Kubernetes ConfigMaps.
+
+\subsection{The development workflow}
+
+\begin{lstlisting}[language=bash]
+make dev        # Postgres, MinIO, registry, API :8080, portal :3000, agents
+make test       # pytest against a throwaway lab_test database
+make lint       # ruff: syntax errors, undefined names, unused imports
+make sim        # five simulated lab PCs in Docker
+make sim-exam   # break them in thirteen different ways
+\end{lstlisting}
+
+A \texttt{Makefile} here is only a list of named shortcuts; it does not build
+anything. It helps newcomers find the important commands without reading the
+README.

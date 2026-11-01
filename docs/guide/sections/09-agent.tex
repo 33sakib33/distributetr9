@@ -1,0 +1,118 @@
+\section{The Agent on Each Lab PC}
+
+\subsection{Standard library only}
+
+\texttt{agent/} imports nothing outside Python's standard library: HTTP with
+\texttt{urllib.request}, JSON with \texttt{json}, processes with
+\texttt{subprocess}, threads with \texttt{threading}. Installing it is copying
+files; updating it is copying newer files. On a fleet of sixty PCs, ``no
+\texttt{pip install}'' removes a whole class of failures (no network to PyPI, a
+mirror down, a dependency that changed).
+
+\subsection{The main loop}
+
+\begin{lstlisting}[language=Python]
+def run_forever(self):
+    self.register()
+    while True:
+        status, hb = self.heartbeat()
+        update = hb.get("agent_update")
+        if update and self.maybe_update(update):
+            sys.exit(updater.EXIT_UPDATED)   # launcher restarts new code
+        if not self.healthy or self.busy or hb["command"] in {"drain",
+                                                              "quarantine"}:
+            time.sleep(5)
+            continue
+        status, payload = self.claim()       # long poll
+        if payload.get("attempt"):
+            self.execute(payload["attempt"])
+        elif payload.get("build"):
+            self.execute_build(payload["build"])
+\end{lstlisting}
+
+While a job runs, a second thread renews the lease every few seconds. If a
+renew response says \texttt{desired\_state: cancel} (the student pressed Cancel,
+or the server's runtime limit passed), the agent sets a \texttt{stop} event and
+the executor stops the container.
+
+\subsection{A real bug: a blocking read}
+
+The executor first read job output like this:
+
+\begin{lstlisting}[language=Python]
+# before
+while True:
+    if stop.is_set():
+        kill_container(); return 143, "cancelled"
+    line = proc.stdout.readline()      # waits here until a line arrives
+    if line:
+        on_line(line)
+    elif proc.poll() is not None:
+        break
+    if time.time() > deadline:
+        kill_container(); return 124, "timeout"
+\end{lstlisting}
+
+\texttt{readline()} \emph{blocks}: it does not return until the process prints
+another line or exits. A training script that prints ``starting'' and then
+trains silently for an hour leaves the loop stuck inside \texttt{readline()}
+for that hour. During that time it never checks \texttt{stop} or the deadline,
+so \textbf{Cancel did nothing and time limits were ignored}. The unit tests
+used chatty scripts and never noticed; the simulated failure exam, which runs a
+silent \texttt{time.sleep(120)} job, caught it.
+
+The fix moves reading to a background thread that feeds a queue. The main loop
+waits on the queue for at most half a second, so it checks \texttt{stop} and the
+deadline twice a second no matter what the job prints:
+
+\begin{lstlisting}[language=Python]
+# after (agent/executor.py)
+def _pump(proc, on_line, stop, deadline) -> str:
+    lines = queue.Queue()
+
+    def reader():
+        for line in proc.stdout:
+            lines.put(line.rstrip("\n"))
+        lines.put(None)                 # end of output
+
+    threading.Thread(target=reader, daemon=True).start()
+    while True:
+        if stop.is_set():
+            return "stop"
+        if time.time() > deadline:
+            return "timeout"
+        try:
+            line = lines.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if line is None:
+            proc.wait()
+            return "exited"
+        on_line(line)
+\end{lstlisting}
+
+\paragraph{The general lesson.} Any loop that must react to more than one thing
+(a cancel flag, a timer, incoming data) must never block on just one of them.
+Other ways to solve the same problem: \texttt{select()} or \texttt{poll()} on
+file descriptors, \texttt{asyncio} with timeouts, or Go's \texttt{select} over
+channels. The regression tests start a script that prints once and sleeps for
+60 seconds, then assert that a 1-second timeout and a cancel both return within
+a few seconds. On the old code they hang.
+
+\subsection{Knobs for simulation}
+
+Three environment variables let a GPU-less container pretend to be a lab PC:
+
+\begin{description}
+\item[\texttt{LAB\_FAKE\_GPU=ampere-8g:8192:8.6}] report this class, VRAM and
+  compute capability. Jobs still run on CPU because \verb|--gpus| is only
+  added when \texttt{nvidia-smi} works.
+\item[\texttt{LAB\_FAKE\_BUSY\_FILE=/sim/busy}] while the file exists, report
+  the desktop GPU as busy.
+\item[\texttt{LAB\_FAKE\_DISK\_FREE\_FILE=/sim/disk\_free}] report the number
+  in the file as free disk space.
+\end{description}
+
+Test seams like these, small, explicit and off by default, let the failure
+exam toggle conditions with \texttt{docker exec sim-pc-3 touch /sim/busy}
+instead of really filling a disk.

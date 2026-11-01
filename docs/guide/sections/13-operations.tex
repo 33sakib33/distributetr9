@@ -1,0 +1,71 @@
+\section{Running It in Production}
+
+\subsection{Docker Compose stacks}
+
+Docker Compose describes several containers, their settings, networks and
+volumes in one YAML file. The project has three:
+
+\begin{description}
+\item[\texttt{docker-compose.yml}] development services (Postgres, MinIO,
+  registry); the API usually runs on the host for fast reloads.
+\item[\texttt{sim/docker-compose.sim.yml}] an \emph{overlay} adding the
+  containerized control plane and five simulated PCs, enabled with
+  \verb|--profile sim|. Compose merges overlay files on top of the base file.
+\item[\texttt{deploy/docker-compose.prod.yml}] the production stack:
+  Postgres, MinIO, registry, API, portal and Caddy. Only Caddy publishes ports.
+\end{description}
+
+\paragraph{Required variables.} In the production file every secret is
+written as \verb|${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}|. The
+\texttt{:?} syntax makes Compose refuse to start, naming the variable, when it
+is unset or empty. Forgetting a secret is a startup error, not a silent default.
+
+\paragraph{Health checks and ordering.} Services declare health checks (for
+example \texttt{pg\_isready} for Postgres), and dependants wait with
+\texttt{condition: service\_healthy}. The API never starts before its database
+accepts connections.
+
+\subsection{Backups}
+
+\texttt{deploy/backup.sh} saves three things:
+\begin{itemize}
+\item Postgres, with \texttt{pg\_dump -Fc} (a compressed, restorable dump);
+\item the MinIO bucket, with \texttt{mc mirror};
+\item the agent signing key. Losing it would mean every PC rejects every future
+  update until reinstalled.
+\end{itemize}
+
+Registry images are deliberately left out: they can be rebuilt from their
+requirements. A backup is only real once it has been restored, so the restore
+script was tested: back up the development data, restore into a scratch
+database and bucket, and compare. 306 jobs, 99 nodes and 481 objects matched.
+
+\subsection{Alerts}
+
+\texttt{control/app/alerts.py} computes the conditions an administrator must
+hear about without watching a dashboard: a PC offline for ten minutes, low
+disk, many lost leases in an hour, one PC failing repeatedly, a job queued too
+long. New alerts are posted to a chat webhook, each with a one-hour cooldown so
+a persistent problem does not spam.
+
+\subsection{Runbooks}
+
+\texttt{docs/runbooks.md} has twelve step-by-step procedures: stand up the
+server, add a PC, canary an update, drain, quarantine, replace WSL, recover a
+full disk, rotate credentials, back up and restore, clean up storage, daily
+health check, and moving the server. A runbook is written so that someone
+tired at 2 a.m. can follow it, and each step says how to check it worked.
+
+\subsection{Deployment ladder}
+
+\begin{enumerate}
+\item Simulated lab passes the failure exam.
+\item Control plane on an always-on server with production settings.
+\item One canary PC: reboot without login, CUDA job, self-update, rollback.
+\item The failure exam by hand on five real PCs.
+\item Staged rollout 1, 5, 15, 30, 60 PCs, recording success rate and lease
+  losses at each step.
+\end{enumerate}
+
+Each step limits how much can break at once: the same reasoning as rollout
+rings, applied to the whole system.

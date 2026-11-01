@@ -1,0 +1,113 @@
+\section{Testing: From Unit Tests to Chaos}
+
+The project tests at four levels, each catching things the others miss.
+
+\subsection{Level 1: pytest against real services}
+
+The 78 tests in \texttt{tests/} talk to a real Postgres and a real MinIO, not
+mocks. Locking behaviour, unique indexes and transactions only exist in the
+real database; a mocked database would happily ``pass'' the claim-locking bug.
+
+\paragraph{Isolation.} \texttt{tests/conftest.py} drops and recreates a
+\texttt{lab\_test} database and uses a \texttt{lab-test} bucket on every run,
+so tests never touch development data:
+
+\begin{lstlisting}[language=Python]
+async def _recreate_test_db() -> None:
+    conn = await asyncpg.connect(admin_url)
+    await conn.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}" WITH (FORCE)')
+    await conn.execute(f'CREATE DATABASE "{TEST_DB}"')
+    await conn.close()
+
+asyncio.run(_recreate_test_db())
+os.environ["DATABASE_URL"] = with_db(BASE_URL, TEST_DB)  # before app import
+\end{lstlisting}
+
+The environment variable is set before \texttt{app.config} is imported,
+because the settings object reads the environment once, at import time.
+
+\paragraph{Fake agents.} \texttt{harness/client.py} provides a
+\texttt{FakeAgent} that speaks the agent protocol through FastAPI's test
+client. A test reads like a story:
+
+\begin{lstlisting}[language=Python]
+def test_stale_token_rejected(client):
+    portal, agent, job_id = isolated(client)
+    attempt = agent.claim()
+    agent.run_to_complete(attempt)
+    bad = agent.complete(attempt, fencing_token=stale_token())
+    assert bad["status_code"] == 409
+\end{lstlisting}
+
+Each test invents its own GPU class name (\texttt{iso-<random>}), so tests
+cannot steal each other's jobs even though they share one database.
+
+\subsection{Level 2: regression tests that fail on the old code}
+
+When a bug is fixed, its test is first run against the \emph{old} code to
+prove it catches the bug. In this project that was done for the claim-locking
+bug (old code: the second node got nothing), the silent-job bug (old code: hung
+past a 15-second limit), the registry-address bug (old code: the job was handed
+an unpullable digest) and the Turing change. A test that passes on both old and
+new code proves nothing.
+
+\subsection{Level 3: the simulated lab and chaos testing}
+
+Unit tests use fake agents. The simulated lab uses \emph{real} agents in
+\emph{real} containers, then breaks things on purpose, an approach called chaos
+engineering (Netflix's Chaos Monkey made it famous):
+
+\begin{center}
+\begin{tabular}{ll}
+\textbf{Scenario} & \textbf{How it breaks things} \\
+kill\_agent & \texttt{docker exec pc pkill -f agent.py} mid-job \\
+reboot & \texttt{docker restart pc} mid-job \\
+network\_drop & \texttt{docker network disconnect} for a full lease \\
+cancel\_running & cancel a job while it trains \\
+disk\_full & write a tiny number to the fake-disk file \\
+desktop\_busy & touch the fake-busy file \\
+max\_runtime & a 120 s job with a 5 s limit \\
+custom\_env\_via\_registry & build on one PC, pull and run on another \\
+self\_update & start a PC on agent 0.0.1 \\
+\end{tabular}
+\end{center}
+
+Each scenario then asserts the outcome the specification demands, through the
+API: the job completed exactly once with one promoted output, it was retried on
+another node, the stale attempt was fenced, the cut-off PC rejoined. Short
+timers (10 s leases) make the whole exam take about five minutes. It found the
+silent-job bug on its first run, after 66 unit tests had passed.
+
+\subsection{Level 4: real hardware}
+
+Simulation cannot show Windows boot behaviour, real GPU drivers or a campus
+network. The first real PC found two problems no simulation would: Windows
+PowerShell 5.1's stderr handling (see the Windows chapter) and a GPU model missing
+from the class list.
+
+Once those were fixed, the first real GPU job ran on that PC: PyTorch inside the
+container reported \texttt{cuda\_available True} on an NVIDIA GeForce GTX 1660,
+and the output file was promoted. Along the way the agent restarted in the
+middle of the job; the server failed that attempt as \texttt{node\_lost} and the
+retry on the same PC succeeded. The recovery path the chaos exam rehearses had
+just happened for real.
+
+\subsection{Continuous integration}
+
+GitHub Actions runs on every push:
+
+\begin{itemize}
+\item \texttt{control}: start Postgres and MinIO with Docker Compose, install
+  dependencies, run \texttt{ruff}, run \texttt{alembic check} (are the
+  migrations in sync with the models?), run pytest.
+\item \texttt{portal}: \texttt{npm ci} and a production \texttt{next build}.
+\item \texttt{sim-exam}: nightly and on demand, the full simulated failure exam.
+\end{itemize}
+
+CI caught nothing new in this project, which is its job: it makes sure what
+passed on a laptop also passes on a clean machine, every time.
+
+\paragraph{The testing pyramid.} Many fast unit tests at the bottom, fewer
+slower integration tests in the middle, a few slow end-to-end tests at the top.
+This project follows that shape: 78 tests in 16 seconds, 13 chaos scenarios in
+5 minutes, one real PC.

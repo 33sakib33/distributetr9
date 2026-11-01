@@ -1,0 +1,170 @@
+\section{The Database: Locks, Transactions and Migrations}
+
+\subsection{Why PostgreSQL does the hard part}
+
+Sixty PCs can ask for work in the same second. If two of them read ``job 7 is
+free'' at the same time, both may take it. Instead of inventing a locking
+scheme, the scheduler lets PostgreSQL do it with \textbf{transactions} and
+\textbf{row locks}. Each request runs in one transaction: either all of its
+changes are saved together, or none are.
+
+\subsection{SELECT \dots{} FOR UPDATE SKIP LOCKED}
+
+\texttt{SELECT ... FOR UPDATE} reads rows \emph{and locks them} until the
+transaction ends. Another transaction trying to lock the same row waits.
+Adding \texttt{SKIP LOCKED} changes ``wait'' into ``skip it and look at the
+next row''. That one clause turns a table into a safe work queue:
+
+\begin{lstlisting}[language=SQL]
+-- Two workers run this at the same moment.
+BEGIN;
+SELECT id FROM jobs
+ WHERE desired_state = 'run' AND accepted_attempt_id IS NULL
+ ORDER BY priority DESC, created_at
+ LIMIT 1
+ FOR UPDATE SKIP LOCKED;     -- worker A locks job 7, worker B skips to job 8
+-- ... create the attempt ...
+COMMIT;                      -- lock released
+\end{lstlisting}
+
+\subsection{A real bug: locking the whole queue}
+
+The first version of \texttt{claim()} locked \emph{every} waiting job, then
+picked one in Python:
+
+\begin{lstlisting}[language=Python]
+# before: locks all queued jobs for the whole claim
+stmt = (select(Job)
+        .where(Job.desired_state == "run",
+               Job.accepted_attempt_id.is_(None))
+        .with_for_update(skip_locked=True))
+jobs = (await session.scalars(stmt)).all()
+\end{lstlisting}
+
+With two PCs asking at the same moment, PC A locked all twenty queued jobs
+while it decided. PC B skipped every locked row, saw an empty queue, and went
+back to sleep, even though nineteen jobs were waiting. Nothing broke, so no
+test noticed; the cluster just ran slower than it should.
+
+The fix reads candidates \emph{without} locks, decides in Python which job
+fits this node, and then locks \emph{only that one row}. If another node got it
+first, it moves to the next candidate:
+
+\begin{lstlisting}[language=Python]
+# after (control/app/scheduler.py, simplified)
+jobs = (await session.scalars(candidates_stmt.limit(200))).all()
+for job in jobs:
+    if not node_fits_job(node, job, envs.get(job.environment_id)):
+        continue
+    locked = await session.scalar(
+        select(Job).where(Job.id == job.id,
+                          Job.accepted_attempt_id.is_(None))
+                   .with_for_update(skip_locked=True))
+    if locked is None:          # another node won this one
+        continue
+    chosen = locked
+    break
+\end{lstlisting}
+
+The test that proves it opens two database sessions, starts a claim in the
+first \emph{without committing} (so its lock stays held), and checks the second
+still gets the other job. On the old code the second claim returned nothing.
+
+\subsection{Partial unique indexes}
+
+``A node runs at most one job at a time'' is enforced by the database itself,
+not only by Python:
+
+\begin{lstlisting}[language=SQL]
+CREATE UNIQUE INDEX uq_attempts_one_active_per_node
+    ON job_attempts (node_id)
+ WHERE observed_state IN ('leased','starting','running',
+                          'uploading','cancelling','unknown');
+\end{lstlisting}
+
+A \emph{partial} index only covers rows matching its \texttt{WHERE}. Finished
+attempts are not in it, so a node can have hundreds of past attempts but only
+one active. If a bug ever tried to insert a second active attempt, Postgres
+would reject the insert. The idempotency key uses the same trick with
+\texttt{WHERE idempotency\_key IS NOT NULL}.
+
+\paragraph{Other use cases.} ``One active subscription per user'', ``one
+default address per customer'', ``one open shift per employee''.
+
+\subsection{Talking to Postgres from Python: SQLAlchemy async}
+
+The control plane uses SQLAlchemy 2 with the \texttt{asyncpg} driver. Tables
+are Python classes:
+
+\begin{lstlisting}[language=Python]
+class JobAttempt(Base):
+    __tablename__ = "job_attempts"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id"))
+    fencing_token: Mapped[uuid.UUID] = mapped_column(Uuid, unique=True)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    observed_state: Mapped[str] = mapped_column(String(32))
+\end{lstlisting}
+
+\textbf{Why async?} A long-poll claim spends most of its 25 seconds asleep.
+With \texttt{async}/\texttt{await}, one process serves hundreds of waiting
+agents, because a sleeping request costs almost nothing. With one thread per
+request, sixty agents would need sixty threads doing nothing.
+
+\paragraph{A trap we hit.} An async engine keeps a pool of connections that
+belong to the event loop that created them. The operations tool first called
+\texttt{asyncio.run()} twice in a row; the second call started a new loop and
+reused pooled connections from the first, failing with ``attached to a
+different loop''. The fix was to run both steps inside one
+\texttt{asyncio.run()}.
+
+\subsection{Schema migrations with Alembic}
+
+Early on the app created tables at startup with \texttt{create\_all()} and
+patched new columns in with hand-written \texttt{ALTER TABLE ... IF NOT
+EXISTS}. That works until the first real deployment, then becomes dangerous:
+there is no record of which changes a database already has.
+
+\textbf{Alembic} keeps an ordered list of migration scripts and a one-row table,
+\texttt{alembic\_version}, recording which one a database has reached:
+
+\begin{verbatim}
+control/migrations/versions/
+  0001_baseline_schema.py      every table as it was
+  0002_job_idempotency_key.py  adds jobs.idempotency_key + unique index
+  0003_node_update_ring.py     adds nodes.update_ring
+\end{verbatim}
+
+\begin{lstlisting}[language=Python]
+# 0003_node_update_ring.py
+revision = "0003"
+down_revision = "0002"
+
+def upgrade() -> None:
+    op.add_column("nodes", sa.Column("update_ring", sa.Integer(),
+                  server_default=sa.text("2"), nullable=False))
+
+def downgrade() -> None:
+    op.drop_column("nodes", "update_ring")
+\end{lstlisting}
+
+Adding a column is now: edit \texttt{models.py}, run
+\verb|alembic revision --autogenerate -m "..."|, review the generated
+script, commit. The API applies pending migrations on startup.
+
+\paragraph{Adopting migrations on an existing database.} Databases created the
+old way have the tables but no \texttt{alembic\_version} row. On startup,
+\texttt{init\_db} detects that case, applies the old column patches, and
+\emph{stamps} the database at revision \texttt{0001} (records it as already
+there) before upgrading. This was tested on a copy of the real development
+database, then \texttt{alembic check} confirmed the schema matched the models
+exactly.
+
+\paragraph{A detail autogenerate got wrong.} The \texttt{jobs} and
+\texttt{job\_attempts} tables reference each other. Autogenerate put both
+foreign keys inline in \texttt{CREATE TABLE jobs}, but \texttt{job\_attempts}
+did not exist yet. The baseline was edited to add those two keys at the end
+with \texttt{op.create\_foreign\_key}. Always read generated migrations.
+
+\paragraph{Other use cases.} Django migrations, Rails Active Record migrations,
+Flyway and Liquibase in Java, Prisma Migrate in Node.

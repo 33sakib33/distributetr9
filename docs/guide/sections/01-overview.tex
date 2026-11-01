@@ -1,0 +1,163 @@
+\section{The Big Picture}
+
+\subsection{The problem}
+
+A university lab has dozens of Windows desktops with NVIDIA graphics cards.
+Most of the day they sit idle. Meanwhile students training neural networks for
+coursework or a thesis have no GPU at all. distributetr9 connects the two:
+
+\begin{enumerate}
+\item A student uploads \texttt{train.py} (plus optional \texttt{requirements.txt})
+      in a web portal and asks for, say, ``a GPU with at least 6 GB''.
+\item A central server, the \textbf{control plane}, stores the job and puts it
+      in a queue.
+\item A small program on every lab PC, the \textbf{agent}, keeps asking the
+      server ``do you have work for me?''. A free PC with a matching GPU gets
+      the job.
+\item The agent runs the script inside a locked-down \textbf{Docker
+      container}, streams the output lines back live, and uploads the files
+      the script wrote.
+\item The student watches the logs in the browser and downloads the results.
+\end{enumerate}
+
+That sounds simple. The hard part, and the reason most of the code exists, is
+what happens when things go wrong: a PC reboots in the middle of a job, Wi-Fi
+drops for a minute, a student cancels at the exact moment the job finishes, or
+two PCs both think they own the same job. The project's specification puts it
+in one sentence: \emph{the hard problem is not the portal, it is keeping exactly
+one accepted result when nodes disconnect, leases expire, completions are
+retried, and cancellation races completion.}
+
+\subsection{The components}
+
+\begin{verbatim}
+   Student's browser
+        |  HTTPS
+        v
+  +-----------+      +---------------------------------------------+
+  |  Portal   | ---> |              Control plane (FastAPI)        |
+  | (Next.js) |      |  REST API  |  scheduler  |  lease worker    |
+  +-----------+      +------+-------------+-----------------+------+
+                            |             |                 |
+                      +-----v----+  +-----v-----+    +------v------+
+                      | Postgres |  |   MinIO   |    |  Registry   |
+                      | (state)  |  | (files,   |    | (container  |
+                      |          |  |  logs)    |    |  images)    |
+                      +----------+  +-----------+    +------^------+
+                            ^                               |
+              HTTP: register, heartbeat, claim,             | docker pull
+              renew, logs, outputs, complete                |
+                            |                               |
+   +------------------------+----------+--------------------+------+
+   |  Lab PC 1 (Windows + WSL Ubuntu)  |  Lab PC 2  ...  Lab PC 60 |
+   |  launcher -> agent -> docker run  |                           |
+   +-----------------------------------+---------------------------+
+\end{verbatim}
+
+\begin{description}
+\item[Portal] A Next.js web app. It never talks to the database; it forwards
+  every request to the control plane's API.
+\item[Control plane] A Python FastAPI service. It owns all state and makes
+  every decision: who may log in, which job goes to which PC, whether a result
+  is accepted.
+\item[PostgreSQL] The source of truth for users, jobs, attempts and nodes.
+  Its row locks are what make the scheduler safe when many PCs ask for work at
+  once.
+\item[MinIO] An S3-compatible object store for submitted archives, log
+  chunks and output files.
+\item[Registry] A Docker image registry (\texttt{registry:2}). Custom Python
+  environments are built once and pulled from here by every PC.
+\item[Agent] A Python program with no third-party dependencies that runs in
+  WSL Ubuntu on each lab PC. It registers, heartbeats, claims work and runs it.
+\item[Launcher and supervisor] A Windows scheduled task starts WSL at boot
+  without anyone logging in; a small bash launcher keeps the agent running and
+  rolls back bad updates.
+\end{description}
+
+\subsection{Two kinds of node: trainers and builders}
+
+Every lab PC runs the same agent program, in one of two roles chosen at install
+time:
+
+\begin{description}
+\item[Training nodes] (\texttt{role: train}, the default) run students' jobs.
+  They never build environments.
+\item[Build nodes] (\texttt{role: build}) build custom environments from
+  \texttt{requirements.txt}, test them and push them to the registry. They never
+  run training jobs.
+\end{description}
+
+The agent reports its role when it registers, and the same claim endpoint
+hands out different work depending on it:
+
+\begin{lstlisting}[language=Python]
+# control/app/routers/agent.py (simplified)
+@router.post("/agent/claim")
+async def claim_job(node: Node = Depends(get_current_node), ...):
+    if is_train_node(node):
+        attempt = await claim(session, node)          # a training job
+        ...
+    else:
+        build = await claim_build(session, node)      # an environment build
+        ...
+\end{lstlisting}
+
+Why separate them? A build downloads packages from the internet, compiles
+wheels and pushes multi-gigabyte images; a training job wants a quiet machine
+with its whole GPU. Keeping them apart means a slow \texttt{pip install} never
+delays someone's training run, and only the builder needs internet access and
+registry push credentials. In this repository the role is chosen with
+\verb|--role build| on the agent or installer, \verb|-Role build| on the
+Windows bootstrap, or \verb|LAB_NODE_ROLE=build| in the environment.
+
+\paragraph{A current limitation.} A builder only takes builds for its own GPU
+class, or builds marked \texttt{cpu}. Jobs that ask for a GPU class and bring a
+\texttt{requirements.txt} produce a build for that class, so a CPU-only builder
+cannot serve them; they wait in \texttt{building} until a builder with that GPU
+class exists. Catalog environments need no builder at all.
+
+\subsection{Life of a job}
+
+Following one job end to end is the fastest way to understand the system.
+
+\begin{enumerate}
+\item \textbf{Submit.} The portal sends \texttt{POST /jobs} with the archive.
+  The control plane checks the archive, stores it in MinIO under
+  \texttt{submissions/<job-id>/input.tar.gz}, and inserts a \texttt{jobs} row
+  with \texttt{desired\_state = run}.
+\item \textbf{Claim.} Every agent calls \texttt{POST /agent/claim}. The call is
+  a \emph{long poll}: the server holds it open for up to 25 seconds until a job
+  fits. When one fits, the server inserts a \texttt{job\_attempts} row with a
+  fresh random \textbf{fencing token} and a \textbf{lease} that expires in 30
+  seconds.
+\item \textbf{Run.} The agent downloads the input, starts \texttt{docker run},
+  and every few seconds calls \texttt{/renew} to extend the lease. Log lines are
+  posted in numbered chunks.
+\item \textbf{Upload.} Output files are uploaded under an
+  \emph{attempt-specific} prefix, not the final location.
+\item \textbf{Complete.} The agent calls \texttt{/complete} with its fencing
+  token. The server checks the token is still the current one, verifies every
+  output checksum, copies the files to \texttt{jobs/<id>/promoted/}, and marks
+  this attempt as \emph{the} accepted result.
+\item \textbf{Failure path.} If the PC vanishes, the lease runs out. A
+  background worker marks the attempt \texttt{unknown}, then \texttt{failed}
+  with category \texttt{lease\_lost}, and the job goes back in the queue for
+  another PC. If the old PC comes back and tries to complete, its token no
+  longer matches and the server answers \texttt{409 fenced}.
+\end{enumerate}
+
+\subsection{Words used throughout}
+
+\begin{description}
+\item[Node] A lab PC running the agent.
+\item[Job] What the student asked for. A job can have several attempts.
+\item[Attempt] One try at running a job on one node. At most one attempt per
+  job is ever \emph{accepted}.
+\item[Lease] A time-limited claim on a job. Renew it or lose it.
+\item[Fencing token] A random value that identifies the current attempt; stale
+  attempts are rejected because they hold an old token.
+\item[Compatibility class] A label like \texttt{ampere-8g} or
+  \texttt{turing-6g} describing a GPU's architecture and memory band.
+\item[Environment] A container image a job runs in: a maintained catalog image
+  or one built from the student's \texttt{requirements.txt}.
+\end{description}
