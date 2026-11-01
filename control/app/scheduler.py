@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.agent_bundle import is_outdated
 from app.config import settings
 from app.enums import (
     ACTIVE_ATTEMPT_STATES,
@@ -17,7 +18,7 @@ from app.enums import (
     TERMINAL_ATTEMPT_STATES,
 )
 from app.errors import AppError
-from app.models import Artifact, Environment, Job, JobAttempt, Node, Quota
+from app.models import Artifact, Environment, EnvironmentBuild, Job, JobAttempt, Node, Quota
 from app.storage import storage
 
 
@@ -25,11 +26,15 @@ def _resources(job: Job) -> dict[str, Any]:
     return job.resources if isinstance(job.resources, dict) else {}
 
 
-def node_fits_job(node: Node, job: Job) -> bool:
-    return fit_failure(node, job) is None
+def node_fits_job(node: Node, job: Job, env: Environment | None = None) -> bool:
+    return fit_failure(node, job, env) is None
 
 
-def fit_failure(node: Node, job: Job) -> str | None:
+def _node_arch(node: Node) -> str:
+    return node.compute_capability if node.vram_total_mb > 0 else "cpu"
+
+
+def fit_failure(node: Node, job: Job, env: Environment | None = None) -> str | None:
     res = _resources(job)
     gpu_class = res.get("gpu_class")
     if settings.strict_node_class:
@@ -53,6 +58,14 @@ def fit_failure(node: Node, job: Job) -> str | None:
                 return "cc"
         except (TypeError, ValueError):
             return "cc"
+    # A GPU job needs an image built and tested for this node's architecture;
+    # an empty list means the image is not arch-specific.
+    archs = [a for a in (env.gpu_archs if env else None) or [] if a != "cpu"]
+    if min_vram and archs and _node_arch(node) not in archs:
+        return "env"
+    disk_mb = int(res.get("disk_mb") or 0)
+    if disk_mb and node.disk_free_bytes - settings.disk_watermark_bytes < disk_mb * 1024 * 1024:
+        return "disk"
     return None
 
 
@@ -79,6 +92,13 @@ def job_age_seconds(job: Job, now: datetime) -> float:
     if created is None:
         return 0
     return max(0.0, (now - _aware(created, now)).total_seconds())
+
+
+def runtime_exceeded(attempt: JobAttempt, job: Job, now: datetime) -> bool:
+    if attempt.started_at is None:
+        return False
+    limit = timedelta(seconds=job.max_runtime_seconds + settings.runtime_grace_seconds)
+    return now > _aware(attempt.started_at, now) + limit
 
 
 def reserved_skip(node: Node, job: Job, now: datetime, queued: list[Job]) -> bool:
@@ -192,7 +212,27 @@ def node_can_claim(node: Node, now: datetime) -> str | None:
         return "unhealthy"
     if node.disk_free_bytes < settings.disk_watermark_bytes:
         return "disk"
+    if is_outdated(node.agent_version):
+        return "outdated"
     return None
+
+
+async def _ensure_current_registry(session: AsyncSession, env: Environment) -> bool:
+    """Requeue a ready custom build whose image lives on an old registry.
+
+    Returns True when the environment is no longer runnable here.
+    """
+    from app.envbuild import _rebuild_on_current_registry, on_current_registry
+
+    if not env.name.startswith("build-") or on_current_registry(env.image_digest):
+        return False
+    build = await session.scalar(
+        select(EnvironmentBuild).where(EnvironmentBuild.environment_hash == env.name.removeprefix("build-"))
+    )
+    if build is None:
+        return False
+    await _rebuild_on_current_registry(session, env, build)
+    return True
 
 
 async def claim(session: AsyncSession, node: Node) -> JobAttempt | None:
@@ -206,44 +246,52 @@ async def claim(session: AsyncSession, node: Node) -> JobAttempt | None:
     if blocked:
         return None
 
+    # Read candidates without locks and lock only the job this node takes, so
+    # concurrent claims from other nodes skip one row, not the whole queue.
+    # Skipped jobs keep their stored reason; GET /jobs/{id} recomputes it.
+    active = (
+        select(JobAttempt.id)
+        .where(JobAttempt.job_id == Job.id, JobAttempt.observed_state.in_(ACTIVE_ATTEMPT_STATES))
+        .exists()
+    )
     stmt = (
         select(Job)
+        .join(Environment, Environment.id == Job.environment_id)
         .where(
             Job.desired_state == "run",
             Job.accepted_attempt_id.is_(None),
+            Environment.cuda_preflight_ok.is_(True),
+            func.coalesce(Job.pending_reason, "") != "building environment",
+            ~active,
         )
         .order_by(Job.priority.desc(), Job.created_at.asc())
-        .with_for_update(skip_locked=True)
+        .limit(settings.claim_candidate_limit)
     )
     jobs = (await session.scalars(stmt)).all()
+    env_ids = {job.environment_id for job in jobs}
+    envs = {
+        env.id: env
+        for env in (await session.scalars(select(Environment).where(Environment.id.in_(env_ids)))).all()
+    } if env_ids else {}
     chosen: Job | None = None
     for job in jobs:
-        if await _active_attempt_for_job(session, job.id):
+        env = envs.get(job.environment_id)
+        if env is not None and await _ensure_current_registry(session, env):
             continue
-        env = await session.get(Environment, job.environment_id)
-        if env is None or not env.cuda_preflight_ok:
+        if not node_fits_job(node, job, env):
             continue
-        if (job.pending_reason or "") == "building environment":
-            continue
-        if not node_fits_job(node, job):
-            why = fit_failure(node, job)
-            if why == "class":
-                gpu_class = _resources(job).get("gpu_class")
-                job.pending_reason = f"waiting for node class {gpu_class}" if gpu_class else "waiting for a matching node"
-            elif why == "vram":
-                gb = max(1, round(_job_min_vram(job) / 1024))
-                job.pending_reason = f"waiting for a {gb} GB GPU"
-            else:
-                job.pending_reason = pending_reason_for(None, job)
-            continue
-        quota_reason = await _quota_reason(session, job)
-        if quota_reason:
-            job.pending_reason = quota_reason
+        if await _quota_reason(session, job):
             continue
         if reserved_skip(node, job, now, list(jobs)):
-            job.pending_reason = "waiting for a smaller GPU or high-VRAM reservation"
             continue
-        chosen = job
+        locked = await session.scalar(
+            select(Job)
+            .where(Job.id == job.id, Job.desired_state == "run", Job.accepted_attempt_id.is_(None))
+            .with_for_update(skip_locked=True)
+        )
+        if locked is None or await _active_attempt_for_job(session, job.id):
+            continue
+        chosen = locked
         break
     if chosen is None:
         return None
@@ -299,7 +347,13 @@ async def explain_pending(session: AsyncSession, job: Job) -> str | None:
     if _job_min_vram(job) and not vram_ok:
         gb = max(1, round(_job_min_vram(job) / 1024))
         return f"waiting for a {gb} GB GPU"
-    fitting = [n for n in class_nodes if node_fits_job(n, job)]
+    env = await session.get(Environment, job.environment_id)
+    arch_ok = [n for n in vram_ok if fit_failure(n, job, env) != "env"]
+    if vram_ok and not arch_ok:
+        return "waiting for a GPU this environment supports"
+    if arch_ok and all(fit_failure(n, job, env) == "disk" for n in arch_ok):
+        return "waiting for disk on eligible nodes"
+    fitting = [n for n in class_nodes if node_fits_job(n, job, env)]
     if fitting and all(n.disk_free_bytes < settings.disk_watermark_bytes for n in fitting):
         return "waiting for disk on eligible nodes"
     quota_reason = await _quota_reason(session, job)
@@ -364,6 +418,11 @@ async def renew(
 
     if attempt.observed_state == "unknown" and observed_state in {"running", "starting", "uploading", "leased"}:
         attempt.observed_state = observed_state
+
+    # Backstop for an agent that keeps renewing but never enforces the limit.
+    if attempt.observed_state in ACTIVE_ATTEMPT_STATES and runtime_exceeded(attempt, job, now):
+        attempt.failure_category = "timeout"
+        attempt.observed_state = "cancelling"
 
     attempt.lease_expires_at = now + timedelta(seconds=settings.lease_ttl_seconds)
     if resource_usage is not None:
@@ -517,7 +576,10 @@ async def complete(
         job.pending_reason = None
         status = "completed"
     else:
-        category = failure_category or "user_code"
+        if attempt.failure_category == "timeout":
+            category = "timeout"
+        else:
+            category = failure_category or "user_code"
         attempt.observed_state = "failed" if category != "cancelled" else "cancelled"
         attempt.failure_category = category
         attempt.exit_code = exit_code

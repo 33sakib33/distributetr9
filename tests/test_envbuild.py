@@ -271,3 +271,44 @@ def test_builder_does_not_claim_catalog_jobs(client):
     assert attempt is not None
     assert attempt["job_id"] == job["id"]
     trainer.run_to_complete(attempt)
+
+
+def test_expired_build_is_rebuilt_on_demand(client):
+    import asyncio
+
+    from sqlalchemy import update
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.models import EnvironmentBuild
+
+    tag = f"enve-{uuid.uuid4().hex[:8]}"
+    req = f"pkg-{uuid.uuid4().hex[:10]}==1.0.0\n"
+    portal = Portal(client)
+    portal.submit_job(gpu_class=tag, min_vram_mb=1000, requirements=req)
+    builder = FakeAgent(client, hostname=f"b-{tag}", caps=_caps(tag, 8000), role="build")
+    builder.register()
+    builder.heartbeat()
+    build = client.post("/agent/claim", json={}, headers=builder._headers()).json()["build"]
+    client.post(
+        f"/agent/builds/{build['build_id']}/complete",
+        json={"ok": True, "image_digest": READY_DIGEST, "lockfile": req, "log": "ok"},
+        headers=builder._headers(),
+    )
+
+    async def expire() -> None:
+        import os
+
+        engine = create_async_engine(os.environ["DATABASE_URL"])
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(EnvironmentBuild)
+                .where(EnvironmentBuild.id == uuid.UUID(build["build_id"]))
+                .values(state="expired", image_digest=None)
+            )
+        await engine.dispose()
+
+    asyncio.run(expire())
+    again = portal.submit_job(gpu_class=tag, min_vram_mb=1000, requirements=req)
+    assert again["status"] == "building"
+    rebuild = client.post("/agent/claim", json={}, headers=builder._headers()).json()["build"]
+    assert rebuild["build_id"] == build["build_id"]

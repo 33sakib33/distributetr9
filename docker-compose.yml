@@ -29,6 +29,11 @@ services:
       - "9001:9001"
     volumes:
       - miniodata:/data
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
 
   registry:
     image: registry:2
@@ -40,7 +45,12 @@ services:
       - registrydata:/var/lib/registry
 
   control:
-    build: ./control
+    # Containerized API for a quick look; day-to-day dev runs it on the host
+    # (scripts/dev.sh). Start with: docker compose --profile control up -d
+    profiles: ["control"]
+    build:
+      context: .
+      dockerfile: control/Dockerfile
     ports:
       - "${CONTROL_PORT:-8080}:8080"
     environment:

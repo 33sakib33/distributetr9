@@ -119,3 +119,26 @@ def test_local_email_login(client):
         assert me.json()["display_name"] == "Lee"
     finally:
         client.cookies.clear()
+
+
+def test_production_refuses_dev_defaults():
+    from app.config import Settings
+
+    problems = Settings(environment="production").production_problems()
+    assert any("DEV_AUTH" in p for p in problems)
+    assert any("TOKEN_PEPPER" in p for p in problems)
+    ok = Settings(
+        environment="production",
+        dev_auth=False,
+        dev_auth_admin=False,
+        oidc_dev=False,
+        oidc_issuer="https://login.uni.edu/realms/campus",
+        oidc_client_id="lab-portal",
+        oidc_client_secret="s" * 32,
+        token_pepper="p" * 32,
+        minio_secret_key="m" * 32,
+        database_url="postgresql+asyncpg://lab:strong@postgres:5432/lab",
+        session_secure=True,
+        agent_signing_key_path="/data/agent-signing-key.pem",
+    )
+    assert ok.production_problems() == []

@@ -27,6 +27,7 @@ export async function GET(req: NextRequest) {
     path: "/",
     httpOnly: true,
     sameSite: "lax",
+    secure: process.env.SESSION_SECURE === "1",
     maxAge: 60 * 60 * 12,
   });
   res.cookies.delete("lab_user");

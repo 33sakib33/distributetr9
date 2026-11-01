@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.agent_bundle import bootstrap_script, current_bundle, install_archive, public_key, update_for
 from app.config import settings
 from app.crypto import hash_token, new_boot_session, new_node_token
 from app.db import get_session
@@ -71,6 +72,7 @@ async def register(
             disk_free_bytes=body.disk_free_bytes,
             last_heartbeat_at=now,
             role=body.role,
+            update_ring=settings.default_update_ring,
             eligibility="eligible" if body.cuda_preflight_ok else "quarantined",
             eligibility_reason=None if body.cuda_preflight_ok else "cuda preflight failed",
         )
@@ -133,6 +135,7 @@ async def register(
         "disconnect_grace_seconds": settings.disconnect_grace_seconds,
         "role": node.role,
         "registry_url": settings.registry_url or None,
+        "bundle_public_key": public_key(),
     }
 
 
@@ -160,7 +163,48 @@ async def heartbeat(
     return {
         "command": _command_for(node),
         "next_heartbeat_seconds": settings.heartbeat_interval_seconds,
+        "agent_update": update_for(node.agent_version, node.update_ring),
     }
+
+
+@router.get("/install/lab-node.tar.gz")
+async def install_package() -> Response:
+    """Agent, WSL installer and Windows scripts for a new lab PC. Public: it is
+    the same code anyone with the repo has; updates are what is signed."""
+    data = install_archive()
+    if data is None:
+        raise AppError(404, "not_found", "install package not available on this server")
+    return Response(content=data, media_type="application/gzip")
+
+
+@router.get("/install/bootstrap.ps1")
+async def install_bootstrap() -> Response:
+    script = bootstrap_script()
+    if script is None:
+        raise AppError(404, "not_found", "bootstrap script not available on this server")
+    return Response(content=script, media_type="text/plain; charset=utf-8")
+
+
+@router.get("/agent/bundle-key")
+async def bundle_key() -> dict:
+    """Public key agents pin at install time to verify update bundles."""
+    return public_key()
+
+
+@router.get("/agent/bundle")
+async def agent_bundle(_node: Node = Depends(get_current_node)) -> Response:
+    bundle = current_bundle()
+    if bundle is None:
+        raise AppError(404, "not_found", "no agent bundle on this server")
+    return Response(
+        content=bundle.data,
+        media_type="application/gzip",
+        headers={
+            "X-Agent-Version": bundle.version,
+            "X-Bundle-Sha256": bundle.sha256,
+            "X-Bundle-Signature": bundle.signature,
+        },
+    )
 
 
 @router.post("/agent/claim")
@@ -221,7 +265,7 @@ async def renew_lease(
     await session.commit()
     return {
         "lease_expires_at": attempt.lease_expires_at.isoformat(),
-        "desired_state": job.desired_state,
+        "desired_state": "cancel" if attempt.failure_category == "timeout" else job.desired_state,
         "observed_state": attempt.observed_state,
     }
 

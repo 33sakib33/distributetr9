@@ -7,6 +7,7 @@ import uuid
 from fastapi import APIRouter, Depends, File, Form, Header, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,12 +23,14 @@ from app.models import (
     Environment,
     Job,
     Node,
+    NodeCredential,
     Project,
     ProjectMember,
     User,
 )
 from app.scheduler import request_cancel
-from app.schemas import MemberAdd, ProjectCreate, QuarantineIn
+from app.agent_bundle import target_version
+from app.schemas import MemberAdd, ProjectCreate, QuarantineIn, RingIn
 from app.seed import ensure_project_quota, ensure_user_quota
 from app.serialize import load_job, node_for_job, serialize_job
 from app.status import derived_status, latest_attempt
@@ -171,10 +174,19 @@ async def create_job(
     args: str = Form(default="[]"),
     resources: str = Form(default="{}"),
     archive: UploadFile = File(),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     await require_project_member(project_id, user, session)
+    idem_key = (idempotency_key or "").strip()[:200] or None
+    if idem_key:
+        existing = await session.scalar(
+            select(Job.id).where(Job.user_id == user.id, Job.idempotency_key == idem_key)
+        )
+        if existing is not None:
+            job = await load_job(session, existing)
+            return serialize_job(job, await node_for_job(session, job))
     if not entrypoint.endswith(".py"):
         raise AppError(400, "invalid", "entrypoint must be a .py file")
     try:
@@ -248,9 +260,21 @@ async def create_job(
             if build is not None and build.state != "ready"
             else ("waiting for a matching GPU" if min_vram else "waiting for a matching node")
         ),
+        idempotency_key=idem_key,
     )
     session.add(job)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        # A concurrent submit with the same Idempotency-Key won the insert.
+        await session.rollback()
+        existing = await session.scalar(
+            select(Job.id).where(Job.user_id == user.id, Job.idempotency_key == idem_key)
+        )
+        if existing is None:
+            raise
+        job = await load_job(session, existing)
+        return serialize_job(job, await node_for_job(session, job))
     key = f"submissions/{job.id}/input.tar.gz"
     checksum = sha256_bytes(data)
     try:
@@ -509,12 +533,82 @@ async def list_nodes(
                 "gpu_desktop_busy": n.gpu_desktop_busy,
                 "disk_free_bytes": n.disk_free_bytes,
                 "agent_version": n.agent_version,
+                "update_ring": n.update_ring,
                 "cpu_cores": n.cpu_cores,
                 "ram_mb": n.ram_mb,
             }
             for n in rows
-        ]
+        ],
+        "agent_target_version": target_version(),
+        "agent_rollout_ring": settings.agent_rollout_ring,
     }
+
+
+@router.get("/admin/alerts")
+async def admin_alerts(
+    _admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from app.alerts import check
+
+    return {"alerts": [{"key": a.key, "severity": a.severity, "message": a.message} for a in await check(session)]}
+
+
+@router.post("/nodes/{node_id}/revoke")
+async def revoke_node(
+    node_id: uuid.UUID,
+    _admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Invalidate a node's token (lost, stolen or re-imaged PC). The PC must be
+    reinstalled with setup-lab-node.sh --reset-identity to join again."""
+    from app.scheduler import db_now, on_node_boot
+
+    node = await session.get(Node, node_id)
+    if node is None:
+        raise AppError(404, "not_found", "node not found")
+    cred = await session.get(NodeCredential, node_id)
+    if cred is not None and cred.revoked_at is None:
+        cred.revoked_at = await db_now(session)
+    node.eligibility = "quarantined"
+    node.eligibility_reason = "credential revoked"
+    await on_node_boot(session, node.id)
+    await session.commit()
+    return {"id": str(node.id), "eligibility": node.eligibility, "reason": node.eligibility_reason}
+
+
+@router.post("/nodes/{node_id}/release")
+async def release_node(
+    node_id: uuid.UUID,
+    _admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Return a drained or quarantined node to service."""
+    node = await session.get(Node, node_id)
+    if node is None:
+        raise AppError(404, "not_found", "node not found")
+    cred = await session.get(NodeCredential, node_id)
+    if cred is not None and cred.revoked_at is not None:
+        raise AppError(409, "conflict", "credential revoked; reinstall the PC with --reset-identity")
+    node.eligibility = "eligible"
+    node.eligibility_reason = None
+    await session.commit()
+    return {"id": str(node.id), "eligibility": node.eligibility}
+
+
+@router.post("/nodes/{node_id}/ring")
+async def set_node_ring(
+    node_id: uuid.UUID,
+    body: RingIn,
+    _admin: User = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    node = await session.get(Node, node_id)
+    if node is None:
+        raise AppError(404, "not_found", "node not found")
+    node.update_ring = body.ring
+    await session.commit()
+    return {"id": str(node.id), "update_ring": node.update_ring}
 
 
 @router.post("/nodes/{node_id}/drain")

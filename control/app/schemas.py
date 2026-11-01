@@ -113,3 +113,7 @@ class DrainIn(BaseModel):
 
 class QuarantineIn(BaseModel):
     reason: str
+
+
+class RingIn(BaseModel):
+    ring: int = Field(ge=0, le=9)

@@ -71,6 +71,15 @@ class Storage:
     def get_log_chunk(self, key: str) -> bytes:
         return gzip.decompress(self.get_bytes(key))
 
+    def list_keys(self, prefix: str) -> list[str]:
+        return [obj.object_name for obj in self.client.list_objects(self.bucket, prefix=prefix, recursive=True)]
+
+    def delete_prefix(self, prefix: str) -> int:
+        keys = self.list_keys(prefix)
+        for key in keys:
+            self.client.remove_object(self.bucket, key)
+        return len(keys)
+
     def presigned_get(self, key: str, expires: timedelta = timedelta(hours=1)) -> str:
         return self.client.presigned_get_object(self.bucket, key, expires=expires)
 

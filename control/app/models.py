@@ -96,6 +96,7 @@ class Node(Base):
     eligibility: Mapped[str] = mapped_column(String(32), nullable=False, default="eligible")
     eligibility_reason: Mapped[str | None] = mapped_column(Text)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="train")
+    update_ring: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("2"))
     gpu_desktop_busy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_health: Mapped[dict | None] = mapped_column(JSONB)
     registered_at: Mapped[datetime] = mapped_column(
@@ -163,6 +164,13 @@ class Job(Base):
             "created_at",
             postgresql_where=text("accepted_attempt_id IS NULL"),
         ),
+        Index(
+            "uq_jobs_user_idempotency_key",
+            "user_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
@@ -183,6 +191,7 @@ class Job(Base):
         ForeignKey("job_attempts.id", use_alter=True, name="fk_jobs_accepted_attempt")
     )
     pending_reason: Mapped[str | None] = mapped_column(Text)
+    idempotency_key: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

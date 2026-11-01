@@ -59,7 +59,16 @@ export type NodeRow = {
   gpu_desktop_busy: boolean;
   disk_free_bytes: number;
   agent_version: string;
+  update_ring: number;
 };
+
+export type NodeList = {
+  nodes: NodeRow[];
+  agent_target_version: string | null;
+  agent_rollout_ring: number;
+};
+
+export type AlertRow = { key: string; severity: string; message: string };
 
 export type Artifact = {
   id: string;

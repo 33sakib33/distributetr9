@@ -4,7 +4,7 @@ import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.catalog import PYTORCH_IMAGE
@@ -145,6 +145,9 @@ async def resolve_environment(
         await session.flush()
     if build.state == "ready" and not on_current_registry(build.image_digest or env.image_digest):
         await _rebuild_on_current_registry(session, env, build)
+    if build.state == "expired":
+        # Image was garbage-collected (app.ops gc); build it again on demand.
+        await _rebuild_on_current_registry(session, env, build)
     if build.state == "ready" and (build.image_digest or env.image_digest):
         env.cuda_preflight_ok = True
         env.lockfile = build.lockfile or spec
@@ -277,14 +280,3 @@ def build_payload(build: EnvironmentBuild) -> dict:
         "need_cuda": (build.compat_class or "cpu") != "cpu",
     }
 
-
-async def migrate_envbuild_columns(conn) -> None:
-    statements = [
-        "ALTER TABLE environment_builds ADD COLUMN IF NOT EXISTS spec TEXT",
-        "ALTER TABLE environment_builds ADD COLUMN IF NOT EXISTS compat_class TEXT",
-        "ALTER TABLE environment_builds ADD COLUMN IF NOT EXISTS error_message TEXT",
-        "ALTER TABLE environment_builds ADD COLUMN IF NOT EXISTS claimed_node_id UUID",
-        "ALTER TABLE environment_builds ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ",
-    ]
-    for stmt in statements:
-        await conn.execute(text(stmt))
