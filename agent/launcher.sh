@@ -18,6 +18,8 @@ switch_current() {
 while true; do
   bash "$ROOT/current/run.sh" "$@"
   code=$?
+  # The next agent reads this to tell the server why it restarted.
+  echo "$code $(date +%s)" > "$ROOT/last_exit" 2>/dev/null || true
   if [ "$code" -eq "$EXIT_UPDATED" ]; then
     echo "lab-agent: updated to $(readlink "$ROOT/current"), restarting"
     continue

@@ -129,6 +129,142 @@ def nvidia_query() -> dict | None:
     }
 
 
+# --- Telemetry samples (job usage, node health) -------------------------------
+# Each tool call has a short timeout and a missing tool yields None fields:
+# sampling must never raise and never hold up a lease renewal.
+
+SAMPLE_TIMEOUT = 5
+
+
+def _float(raw: str | None) -> float | None:
+    try:
+        return float((raw or "").strip().rstrip("%"))
+    except ValueError:
+        return None
+
+
+def parse_nvidia_usage(output: str | None) -> dict:
+    """Parse `utilization.gpu,memory.used,temperature.gpu` CSV lines (one per GPU):
+    busiest GPU's utilisation and temperature, memory summed over GPUs."""
+    pct: list[float] = []
+    vram: list[float] = []
+    temp: list[float] = []
+    for line in (output or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        for bucket, raw in zip((pct, vram, temp), parts):
+            value = _float(raw)
+            if value is not None:
+                bucket.append(value)
+    return {
+        "gpu_pct": max(pct) if pct else None,
+        "vram_mb": sum(vram) if vram else None,
+        "gpu_temp_c": max(temp) if temp else None,
+    }
+
+
+def sample_gpu() -> dict:
+    out = _run(
+        [
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu,memory.used,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=SAMPLE_TIMEOUT,
+    )
+    return parse_nvidia_usage(out)
+
+
+_MEM_UNITS = {
+    "b": 1,
+    "kb": 1000,
+    "kib": 1024,
+    "mb": 1000**2,
+    "mib": 1024**2,
+    "gb": 1000**3,
+    "gib": 1024**3,
+}
+
+
+def parse_mem_mb(raw: str | None) -> float | None:
+    """`12.5MiB / 1GiB` (docker stats MemUsage) -> megabytes used."""
+    used = (raw or "").split("/")[0].strip().lower()
+    digits = used.rstrip("abcdefghijklmnopqrstuvwxyz")
+    unit = used[len(digits) :] or "b"
+    value = _float(digits)
+    if value is None or unit not in _MEM_UNITS:
+        return None
+    return value * _MEM_UNITS[unit] / (1024**2)
+
+
+def parse_docker_stats(output: str | None) -> dict:
+    """Parse one `docker stats --format '{{json .}}'` line."""
+    try:
+        row = json.loads((output or "").strip().splitlines()[0])
+    except (IndexError, ValueError):
+        return {"cpu_pct": None, "ram_mb": None}
+    if not isinstance(row, dict):
+        return {"cpu_pct": None, "ram_mb": None}
+    return {"cpu_pct": _float(row.get("CPUPerc")), "ram_mb": parse_mem_mb(row.get("MemUsage"))}
+
+
+def sample_container(name: str | None) -> dict:
+    if not name:
+        return {"cpu_pct": None, "ram_mb": None}
+    out = _run(
+        ["docker", "stats", "--no-stream", "--format", "{{json .}}", name],
+        timeout=SAMPLE_TIMEOUT,
+    )
+    return parse_docker_stats(out)
+
+
+def collect_usage(container: str | None) -> dict:
+    """gpu_pct, vram_mb, cpu_pct, ram_mb for the renew body; None where unknown."""
+    try:
+        gpu = sample_gpu()
+        box = sample_container(container)
+    except Exception:
+        return {"gpu_pct": None, "vram_mb": None, "cpu_pct": None, "ram_mb": None}
+    return {
+        "gpu_pct": gpu["gpu_pct"],
+        "vram_mb": gpu["vram_mb"],
+        "cpu_pct": box["cpu_pct"],
+        "ram_mb": box["ram_mb"],
+    }
+
+
+def uptime_seconds(path: str = "/proc/uptime") -> int | None:
+    try:
+        return int(float(Path(path).read_text().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def docker_ok() -> bool:
+    return _run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=SAMPLE_TIMEOUT) is not None
+
+
+def collect_health(*, check_docker: bool) -> dict:
+    """Node health for the heartbeat. `docker_ok` is None when docker is not used."""
+    try:
+        gpu = sample_gpu()
+        driver = _run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader,nounits"],
+            timeout=SAMPLE_TIMEOUT,
+        )
+        return {
+            "gpu_temp_c": gpu["gpu_temp_c"],
+            "gpu_pct": gpu["gpu_pct"],
+            "vram_used_mb": None if gpu["vram_mb"] is None else int(gpu["vram_mb"]),
+            "driver_version": driver.splitlines()[0].strip() if driver else None,
+            "uptime_s": uptime_seconds(),
+            "docker_ok": docker_ok() if check_docker else None,
+        }
+    except Exception:
+        return {}
+
+
 def infer_compute_capability(gpu_model: str) -> str:
     lowered = gpu_model.lower()
     if any(tok in lowered for tok in ("4090", "4080", "4070", "4060", "4050")):
