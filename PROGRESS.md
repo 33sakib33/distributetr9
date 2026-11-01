@@ -64,6 +64,26 @@ drivers, campus network) still has to confirm those gates on a canary PC.
   release/revoke, runbooks ([`docs/runbooks.md`](docs/runbooks.md))
 - CI: lint, migration check, portal build; nightly simulated exam
 
+## Load test (sim control plane, laptop)
+
+`python -m harness --api http://127.0.0.1:8090 --agents 100 --jobs 500 --seconds 60`
+against `sim-control` (one uvicorn worker in Docker on a laptop; 500 jobs queued by 25 users, each fake job
+runs 5-15 s with lease renewals and logs; `--chaos` adds dropped leases and stale tokens).
+
+| Measure | Result |
+|---|---|
+| Jobs completed | 500 of 500 in 61 s (8.2 jobs/s; 100 PCs and ~10 s jobs allow at most 10 jobs/s) |
+| Claim latency (500 claims that got a job) | p50 24 ms, p95 734 ms, max 2.2 s |
+| Errors | 0 (no 5xx, no refused call, no exception in the server log) |
+
+The slow tail is the first second, when all 100 PCs claim at once and the single worker serves them in turn
+(about 7 ms of server time per claim); once the PCs are out of step claims take 10-30 ms. With identical job
+lengths the PCs stay in step and each wave of 100 claims queues for up to 1.7 s, so the harness varies job length.
+
+## What's next
+
+The ordered frontend and backend work, with specifications and a progress list, is in [`docs/plan.md`](docs/plan.md).
+
 ## What only you can do
 
 1. **Canary lab PC.** Install with `scripts/setup-lab-node.sh` plus the Windows
