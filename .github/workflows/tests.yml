@@ -4,35 +4,45 @@ on:
   push:
   pull_request:
 
+env:
+  DATABASE_URL: postgresql+asyncpg://lab:lab@127.0.0.1:5433/lab
+  MINIO_ENDPOINT: 127.0.0.1:9000
+  MINIO_ACCESS_KEY: labminio
+  MINIO_SECRET_KEY: labminio
+  MINIO_SECURE: "false"
+
 jobs:
-  scheduler:
-    runs-on: ubuntu-latest
+  control:
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: control/requirements.txt
       - name: Start Postgres and MinIO
         run: docker compose up -d --wait postgres minio
-      - name: Wait for MinIO
-        run: |
-          for i in $(seq 1 40); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker compose logs minio
-          exit 1
       - name: Install control dependencies
         run: pip install -r control/requirements.txt
-      - name: Run tests
-        env:
-          DATABASE_URL: postgresql+asyncpg://lab:lab@127.0.0.1:5433/lab
-          MINIO_ENDPOINT: 127.0.0.1:9000
-          MINIO_ACCESS_KEY: labminio
-          MINIO_SECRET_KEY: labminio
-          MINIO_BUCKET: lab
-          MINIO_SECURE: "false"
+      - name: Lint
+        run: ruff check control agent harness tests scripts sim
+      - name: Migrations match the models
+        working-directory: control
+        run: alembic upgrade head && alembic check
+      - name: Tests
         run: pytest tests -v
+
+  portal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+      - working-directory: portal
+        run: npm ci && npm run build

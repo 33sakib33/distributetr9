@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
 
 from agent.agent import resolve_attempt_root
 

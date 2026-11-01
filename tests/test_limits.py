@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from app.config import settings
-from harness.jobs import Portal
 from tests.test_scheduler_races import isolated
 
 

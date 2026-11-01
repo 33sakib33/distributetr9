@@ -1,116 +1,116 @@
 # Lab ML job platform
 
-Control API + Postgres + MinIO on this machine. Agents on any desktop on the same Wi-Fi.
+Turns a lab of Windows PCs with consumer GPUs into a shared GPU cluster.
+Students submit a Python training script in the portal; an idle lab PC runs it
+in a Docker container under WSL, streams the logs, and returns the outputs.
 
-Build status: [`PROGRESS.md`](PROGRESS.md). Spec: [`spec/README.md`](spec/README.md). Image registry (why, theory, how): [`docs/image-registry.md`](docs/image-registry.md).
+- **control/**: FastAPI control plane (Postgres, MinIO, scheduler, agent API)
+- **agent/**: stdlib-only agent for each lab PC, self-updating
+- **portal/**: Next.js web UI
+- **sim/**: a simulated five-PC lab in Docker, plus the scripted failure exam
+- **deploy/**: production stack (HTTPS via Caddy), backups, restore
+- **scripts/**: dev launcher, lab PC installer, smoke test
 
-## Start the control plane
+Status: [`PROGRESS.md`](PROGRESS.md). Design: [`spec/README.md`](spec/README.md).
+Operations: [`docs/runbooks.md`](docs/runbooks.md). Registry background:
+[`docs/image-registry.md`](docs/image-registry.md).
 
-Keep Postgres and MinIO in Docker, and run the API on the Mac host. Docker-published ports often fail from other machines with `No route to host` because of the macOS firewall.
+## Develop on one machine
 
-```bash
-docker compose up -d postgres minio registry
-./scripts/run-control-lan.sh
-```
-
-API: `http://<this-Mac-Wi-Fi-IP>:8080` (currently `192.168.68.118`)
-Health: `curl http://127.0.0.1:8080/health`
-
-Registry (image distribution): `registry:2` on host port **5001** (5000 is AirPlay / Control Center on macOS). Set `REGISTRY_URL=<reachable-host>:5001` before custom `requirements.txt` will be accepted. Mirror the catalog image with `scripts/mirror-catalog.sh`. Lab Docker daemons need `"insecure-registries": ["<host>:5001"]` in `/etc/docker/daemon.json`. If Docker-published 5001 is unreachable from other PCs (same macOS firewall issue as 8080), run the registry on a Linux host agents can actually hit.
-
-After switching Wi-Fi, get the new IP with `ipconfig getifaddr en0` and point the desktop agent at that.
-
-If macOS asks to allow incoming connections for Python, click **Allow**.
-
-If the other desktop still gets `No route to host`, both machines are probably isolated on Wi-Fi (guest network / AP isolation). Put them on the same main SSID, not guest.
-
-## Submit a job (this Mac)
+Needs Docker, Python 3.12 and Node 22.
 
 ```bash
-python3 scripts/smoke.py
-# GPU job for the 3050 node (after it is registered as ampere-8g):
-# LAB_SMOKE=cuda python3 scripts/smoke.py
+python3 -m venv control/.venv && control/.venv/bin/pip install -r control/requirements.txt
+make dev        # Postgres, MinIO, registry, API :8080, portal :3000, a train + build agent
 ```
 
-Dev auth header is `X-Dev-User: alice@uni.edu` when `DEV_AUTH=1` (tests, smoke, harness). The portal uses university OIDC.
-
-## Portal
-
-```bash
-./scripts/run-portal.sh
-```
-
-Open `http://127.0.0.1:3000`, click Sign in, enter your university email. Use `admin@uni.edu` if you need the Nodes page.
-
-## Run an agent (this Mac or the other desktop)
-
-On a Windows lab PC (WSL Ubuntu), one installer sets up Docker, `/etc/lab-agent`, and `/var/lab/attempts`. It does **not** start the agent at boot:
-
-```bash
-# inside WSL, from this repo (or scripts\setup-lab-node.cmd from Windows)
-sudo bash scripts/setup-lab-node.sh --api http://<mac-lan-ip>:8080
-# optional campus registry:
-# sudo bash scripts/setup-lab-node.sh --api http://<mac-lan-ip>:8080 --registry <mac-lan-ip>:5001
-# GPU nodes later: add --gpu
-```
-
-Then start it yourself:
-
-```bash
-lab-agent
-# or: bash /opt/lab-agent/run.sh
-```
-
-Manual start (no installer): copy the whole `agent/` folder, then:
-
-```bash
-python3 agent/agent.py --api http://192.168.68.118:8080
-# Environment builder (does not take training jobs):
-# python3 agent/agent.py --api http://192.168.68.118:8080 --role build --executor docker
-```
-
-`--executor auto` (default) uses Docker when the daemon is reachable, otherwise local Python. Force one or the other with `--executor docker` or `--executor python`. On WSL, prefer `bash agent/run.sh` so the process runs in the `docker` group even before a new login.
-
-The agent classifies the GPU (`ampere-8g`, `ada-12g`, `cpu`, …) instead of a generic `gpu` label. It skips claims when CUDA preflight fails, the node is draining/quarantined, or the desktop GPU looks busy.
-
-The PyTorch catalog environment is `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime`. `LAB_IMAGE` still overrides. On start, a Docker agent removes leftover `lab-*` containers.
-
-Windows lab PC: copy `supervisor/` as well and follow [`supervisor/README.md`](supervisor/README.md). Probe the machine first:
-
-```bash
-python3 inventory/probe.py --append inventory/lab.jsonl
-```
-
-If macOS or Windows firewall blocks port 8080, allow incoming TCP 8080 on this Mac. The registry needs TCP 5001 as well.
-
-Live logs: `GET /jobs/{id}/logs/stream` (SSE). Reconnect with `Last-Event-ID` set to the last seq.
+Open http://127.0.0.1:3000 and sign in with any `@uni.edu` address (a mock
+campus login; `admin@uni.edu` sees the Nodes page). `python3 scripts/smoke.py`
+submits a test job from the command line. Logs are in `.dev/logs/`.
 
 ## Tests
 
-Postgres and MinIO must be up. Then:
-
 ```bash
-docker compose up -d postgres minio
-control/.venv/bin/pytest tests -v
+make test       # starts Postgres + MinIO, runs pytest against its own lab_test database
+make lint
 ```
 
-Optional stress (needs the control API running):
+Schema changes go through Alembic:
 
 ```bash
-python -m harness --api http://127.0.0.1:8080 --agents 100 --jobs 500 --seconds 60
+cd control && ../control/.venv/bin/alembic revision --autogenerate -m "what changed"
 ```
+
+The API applies migrations on startup.
+
+## Simulated lab
+
+Five lab PCs as containers, each with its own Docker daemon and fake GPU
+(2 × `ampere-8g`, `ada-12g`, `ada-24g`, plus a builder), against a
+containerized control plane on port 8090. One node starts on an old agent
+version and updates itself.
+
+```bash
+make sim        # build and start
+make sim-exam   # kill agents, reboot PCs, cut the network, fill disks, cancel, time out...
+make sim-down
+```
+
+`control/.venv/bin/python -m sim.exam reboot network_drop` runs single
+scenarios. The exam also runs nightly in CI.
+
+## Production
+
+On an always-on Linux server in the lab:
+
+```bash
+cp deploy/prod.env.example deploy/prod.env      # fill in every value
+docker compose -f deploy/docker-compose.prod.yml --env-file deploy/prod.env up -d --build
+```
+
+The API refuses to start while any dev default (dev login, default passwords,
+mock identity provider) is still set. Full procedure, including backups and
+updates: [`docs/runbooks.md`](docs/runbooks.md).
+
+## Lab PCs
+
+One command in an Administrator PowerShell on each PC sets up WSL, Docker, the
+agent and the boot task, and waits until the PC registers:
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm http://<server>:8080/install/bootstrap.ps1)))"
+```
+
+For HTTPS with the lab's own CA, see runbook 2 in
+[`docs/runbooks.md`](docs/runbooks.md). From a copy of the repo instead:
+`supervisor\bootstrap.cmd -Api http://<server>:8080 -Registry <server>:5001`.
+After that, agents update themselves from the control plane (signed bundles,
+canary rings, automatic rollback).
+
+Manual install inside WSL Ubuntu, if you prefer:
+
+```bash
+sudo bash scripts/setup-lab-node.sh --api https://<api-host> --registry <registry-host> --ca-cert lab-ca.crt --gpu
+```
+
+For a quick test against a laptop instead of a server:
+
+```bash
+sudo bash scripts/setup-lab-node.sh --api http://<laptop-ip>:8080 --registry <laptop-ip>:5001
+lab-agent
+```
+
+The laptop's firewall must allow TCP 8080 and 5001, and both machines must be
+on the same network (not a guest Wi-Fi with client isolation).
 
 ## Useful endpoints
 
-| Method | Path | Auth |
-|--------|------|------|
-| GET | `/health` | none |
-| GET | `/me` | session cookie or `X-Dev-User` |
-| GET | `/auth/login` | OIDC redirect |
-| GET | `/environments` | none |
-| POST | `/projects` | `X-Dev-User` |
-| POST | `/jobs` | multipart + `X-Dev-User` |
-| GET | `/jobs/{id}` | `X-Dev-User` |
-| GET | `/jobs/{id}/logs/stream` | `X-Dev-User` (SSE) |
-| GET | `/nodes` | admin `X-Dev-User` |
-| POST | `/agent/register` | none first time |
+| Method | Path | Who |
+|--------|------|-----|
+| GET | `/health` | anyone |
+| POST | `/jobs` | user (multipart; optional `Idempotency-Key`) |
+| GET | `/jobs/{id}`, `/jobs/{id}/logs/stream` | user (SSE logs) |
+| GET | `/nodes`, `/admin/alerts` | admin |
+| POST | `/nodes/{id}/drain`, `quarantine`, `release`, `ring`, `revoke` | admin |
+| GET | `/agent/bundle-key`, `/agent/bundle` | agents |
+| GET | `/install/bootstrap.ps1`, `/install/lab-node.tar.gz` | new lab PCs |

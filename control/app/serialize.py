@@ -3,17 +3,14 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db import get_session
-from app.deps import get_job_for_user
 from app.errors import AppError
 from app.models import Job, JobAttempt, Node
 from app.status import derived_status, latest_attempt, timings
-from app.storage import storage
 
 router = APIRouter()
 
