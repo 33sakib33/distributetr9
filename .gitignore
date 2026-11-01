@@ -23,3 +23,6 @@ portal/.env.local
 *.zip
 .distributetr9/
 
+.dev/
+deploy/prod.env
+backups/

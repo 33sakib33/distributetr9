@@ -8,10 +8,13 @@ cd "$ROOT"
 
 # Load .env if present (REGISTRY_URL, etc.) without overriding an explicit export.
 if [ -f "$ROOT/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$ROOT/.env"
-  set +a
+  while IFS='=' read -r key value; do
+    case "$key" in ''|\#*) continue ;; esac
+    key="$(echo "$key" | tr -d '[:space:]')"
+    if [ -z "${!key+x}" ]; then
+      export "$key=$value"
+    fi
+  done < "$ROOT/.env"
 fi
 
 LAN_HOST="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
