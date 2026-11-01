@@ -20,6 +20,7 @@ async function proxy(req: NextRequest, path: string[]) {
   if (contentType) headers.set("content-type", contentType);
   const accept = req.headers.get("accept");
   if (accept) headers.set("accept", accept);
+  headers.set("X-Request-ID", req.headers.get("x-request-id") || crypto.randomUUID());
   const lastEvent = req.headers.get("last-event-id");
   if (lastEvent) headers.set("Last-Event-ID", lastEvent);
 
@@ -31,7 +32,7 @@ async function proxy(req: NextRequest, path: string[]) {
 
   const res = await fetch(dest, init);
   const out = new Headers();
-  for (const key of ["content-type", "content-disposition", "cache-control", "x-accel-buffering", "location"]) {
+  for (const key of ["content-type", "content-disposition", "cache-control", "x-accel-buffering", "location", "x-request-id"]) {
     const value = res.headers.get(key);
     if (value) out.set(key, value);
   }
