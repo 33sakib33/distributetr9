@@ -140,6 +140,50 @@ def test_two_jobs_share_build_and_skip_gpu_until_ready(client):
     assert builder.claim() is None
 
 
+def test_ready_build_on_old_registry_is_rebuilt(client):
+    tag = f"envr-{uuid.uuid4().hex[:8]}"
+    req = f"pkg-{uuid.uuid4().hex[:10]}==1.0.0\n"
+    old_digest = "10.0.0.9:5001/lab-env/old@sha256:" + ("cd" * 32)
+    portal = Portal(client)
+    first = portal.submit_job(gpu_class=tag, min_vram_mb=1000, requirements=req)
+    builder = FakeAgent(client, hostname=f"b-{tag}", caps=_caps(tag, 8000), role="build")
+    builder.register()
+    builder.heartbeat()
+    build = client.post("/agent/claim", json={}, headers=builder._headers()).json()["build"]
+    done = client.post(
+        f"/agent/builds/{build['build_id']}/complete",
+        json={"ok": True, "image_digest": old_digest, "lockfile": req, "log": "old registry"},
+        headers=builder._headers(),
+    )
+    assert done.json()["state"] == "ready"
+    assert portal.get_job(first["id"])["status"] == "queued"
+
+    # REGISTRY_URL is 127.0.0.1:5000 in tests, so the ready digest is unpullable.
+    second = portal.submit_job(gpu_class=tag, min_vram_mb=1000, requirements=req)
+    assert second["environment_id"] == first["environment_id"]
+    assert second["status"] == "building"
+    assert portal.get_job(first["id"])["status"] == "building"
+
+    trainer = FakeAgent(client, hostname=f"t-{tag}", caps=_caps(tag, 8000), role="train")
+    trainer.register()
+    trainer.heartbeat()
+    assert trainer.claim() is None
+
+    rebuild = client.post("/agent/claim", json={}, headers=builder._headers()).json()["build"]
+    assert rebuild["build_id"] == build["build_id"]
+    assert rebuild["image_tag"].startswith(settings.registry_url + "/lab-env/")
+    client.post(
+        f"/agent/builds/{rebuild['build_id']}/complete",
+        json={"ok": True, "image_digest": READY_DIGEST, "lockfile": req, "log": "rebuilt"},
+        headers=builder._headers(),
+    )
+    attempt = trainer.claim()
+    assert attempt is not None
+    assert attempt["image_digest"] == READY_DIGEST
+    trainer.run_to_complete(attempt)
+    trainer.run_to_complete(trainer.claim())
+
+
 def test_local_image_id_does_not_queue(client):
     tag = f"envl-{uuid.uuid4().hex[:8]}"
     req = f"pkg-{uuid.uuid4().hex[:10]}==1.0.0\n"

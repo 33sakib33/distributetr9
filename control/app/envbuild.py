@@ -71,6 +71,37 @@ def image_tag_for(env_hash: str) -> str:
     return image_ref_for(env_hash)
 
 
+def on_current_registry(image_digest: str | None) -> bool:
+    host = settings.registry_url.strip().rstrip("/")
+    if not host or not image_digest:
+        return True
+    return image_digest.strip().split("/", 1)[0] == host
+
+
+async def _rebuild_on_current_registry(
+    session: AsyncSession, env: Environment, build: EnvironmentBuild
+) -> None:
+    # The hash does not include the registry, so a move (new LAN IP) leaves ready
+    # builds pointing at a host lab PCs can no longer pull from.
+    build.state = "pending"
+    build.image_digest = None
+    build.claimed_node_id = None
+    build.started_at = None
+    build.finished_at = None
+    build.error_message = None
+    env.image_digest = image_tag_for(build.environment_hash)
+    env.cuda_preflight_ok = False
+    jobs = (
+        await session.scalars(
+            select(Job).where(Job.environment_id == env.id, Job.accepted_attempt_id.is_(None))
+        )
+    ).all()
+    for job in jobs:
+        if job.desired_state != "cancel":
+            job.pending_reason = "building environment"
+            job.completed_at = None
+
+
 async def resolve_environment(
     session: AsyncSession,
     *,
@@ -112,6 +143,8 @@ async def resolve_environment(
         )
         session.add(build)
         await session.flush()
+    if build.state == "ready" and not on_current_registry(build.image_digest or env.image_digest):
+        await _rebuild_on_current_registry(session, env, build)
     if build.state == "ready" and (build.image_digest or env.image_digest):
         env.cuda_preflight_ok = True
         env.lockfile = build.lockfile or spec
