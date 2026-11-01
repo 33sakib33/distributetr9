@@ -19,7 +19,7 @@ sim:
 	docker compose -f docker-compose.yml -f sim/docker-compose.sim.yml --profile sim up -d --build --wait
 
 sim-down:
-	docker compose -f docker-compose.yml -f sim/docker-compose.sim.yml --profile sim down
+	docker compose -f docker-compose.yml -f sim/docker-compose.sim.yml --profile sim rm -sf sim-control sim-pc-1 sim-pc-2 sim-pc-3 sim-pc-4 sim-builder
 
 sim-exam:
 	$(PY) -m sim.exam

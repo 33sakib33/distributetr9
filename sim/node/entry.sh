@@ -3,11 +3,30 @@
 # reboot: the install and node identity survive, running jobs do not.
 set -u
 
-dockerd-entrypoint.sh dockerd --insecure-registry "${SIM_REGISTRY:-registry:5000}" >/var/log/dockerd.log 2>&1 &
-for _ in $(seq 1 60); do
-  docker info >/dev/null 2>&1 && break
-  sleep 1
-done
+start_dockerd() {
+  # `docker restart` keeps /var/run, so the old daemon's pid files are still
+  # there and the new dockerd refuses to start next to a "running" one.
+  rm -f /var/run/docker.pid /var/run/docker/containerd/containerd.pid
+  dockerd-entrypoint.sh dockerd --insecure-registry "${SIM_REGISTRY:-registry:5000}" >>/var/log/dockerd.log 2>&1 &
+}
+
+docker_ready() {
+  for _ in $(seq 1 60); do
+    timeout 5 docker info >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+start_dockerd
+if ! docker_ready; then
+  echo "entry: dockerd did not come up within 60 s; restarting it once" >&2
+  pkill -x dockerd
+  pkill -x containerd
+  sleep 3
+  start_dockerd
+  docker_ready || echo "entry: dockerd is still not up; continuing without it" >&2
+fi
 
 ROOT=/opt/lab-agent
 if [ ! -e "$ROOT/current" ]; then

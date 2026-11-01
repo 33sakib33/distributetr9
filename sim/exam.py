@@ -78,7 +78,7 @@ class Lab:
             self.project_id = self.post("/projects", json={"name": "exam"})["id"]
         envs = {e["name"]: e["id"] for e in self.get("/environments")["environments"]}
         # The slim-Python catalog image keeps simulated jobs small and multi-arch.
-        self.env_id = envs["tensorflow-stable"]
+        self.env_id = envs["python-cpu"]
 
     def get(self, path: str, headers: dict = USER) -> dict:
         resp = self.http.get(path, headers=headers)

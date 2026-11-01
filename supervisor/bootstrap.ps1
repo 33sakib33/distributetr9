@@ -26,6 +26,8 @@ param(
     [string]$Api = "__LAB_API__",
     [string]$Registry = "__LAB_REGISTRY__",
     [ValidateSet("train", "build")][string]$Role = "train",
+    # The lab room this PC is in (shown in the portal): "Lab 204".
+    [string]$Room = "",
     [ValidateSet("auto", "yes", "no")][string]$Gpu = "auto",
     [string]$CaCert = "",
     [string]$Distro = "Ubuntu",
@@ -216,6 +218,7 @@ Step "Installing Docker and the agent inside $Distro (this takes a few minutes)"
 $installer = @("env", "LAB_USER=$LinuxUser", "bash", (ConvertTo-WslPath (Join-Path $src "scripts\setup-lab-node.sh")),
     "--api", $Api, "--role", $Role)
 if ($Registry) { $installer += @("--registry", $Registry) }
+if ($Room) { $installer += @("--room", $Room) }
 if ($useGpu) { $installer += "--gpu" }
 if ($CaCert) { $installer += @("--ca-cert", (ConvertTo-WslPath $CaCert)) }
 if ($ResetIdentity) { $installer += "--reset-identity" }

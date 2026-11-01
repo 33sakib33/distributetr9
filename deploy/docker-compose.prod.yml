@@ -4,7 +4,8 @@
 #   docker compose -f deploy/docker-compose.prod.yml --env-file deploy/prod.env up -d --build
 #
 # Only Caddy publishes ports (80/443). Postgres and MinIO stay on the internal
-# network; the API, portal and registry are reached through HTTPS hostnames.
+# network; the API, portal, registry and Grafana are reached through HTTPS
+# hostnames. Prometheus is internal only (Grafana and the scrape use it).
 name: lab-prod
 
 services:
@@ -78,6 +79,15 @@ services:
       AGENT_MIN_VERSION: ${AGENT_MIN_VERSION:-}
       AGENT_ROLLOUT_RING: ${AGENT_ROLLOUT_RING:-2}
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      LAB_TIMEZONE: ${LAB_TIMEZONE:-UTC}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-lab@localhost}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-1}
+      METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN}
+      LOG_FORMAT: json
     volumes:
       - controldata:/data
     depends_on:
@@ -96,6 +106,45 @@ services:
     depends_on:
       - control
 
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN}
+    # The config reads the bearer token from a file; write it from the
+    # environment first (Prometheus does not expand variables in its config).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        printf '%s' "$$METRICS_TOKEN" > /tmp/metrics-token
+        exec /bin/prometheus \
+          --config.file=/etc/prometheus/prometheus.yml \
+          --storage.tsdb.path=/prometheus \
+          --storage.tsdb.retention.time=30d \
+          --web.listen-address=0.0.0.0:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheusdata:/prometheus
+    depends_on:
+      - control
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_SERVER_ROOT_URL: https://${GRAFANA_HOST:?set GRAFANA_HOST}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+
   caddy:
     image: caddy:2.8.4
     restart: unless-stopped
@@ -106,6 +155,7 @@ services:
       API_HOST: ${API_HOST}
       PORTAL_HOST: ${PORTAL_HOST}
       REGISTRY_HOST: ${REGISTRY_HOST}
+      GRAFANA_HOST: ${GRAFANA_HOST:?set GRAFANA_HOST}
       LAB_TLS: ${LAB_TLS:-internal}
       REGISTRY_PUSH_USER: ${REGISTRY_PUSH_USER:?set REGISTRY_PUSH_USER}
       REGISTRY_PUSH_HASH: ${REGISTRY_PUSH_HASH:?set REGISTRY_PUSH_HASH}
@@ -116,6 +166,7 @@ services:
       - control
       - portal
       - registry
+      - grafana
 
 volumes:
   pgdata:
@@ -123,3 +174,5 @@ volumes:
   registrydata:
   controldata:
   caddydata:
+  prometheusdata:
+  grafanadata:

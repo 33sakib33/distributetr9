@@ -37,6 +37,10 @@ services:
       MINIO_BUCKET: lab-sim
       MINIO_SECURE: "false"
       REGISTRY_URL: registry:5000
+      # The one builder must stay free for the exam's pip builds, not pull framework images.
+      MIRROR_CATALOG_IMAGES: "0"
+      # Start every `make sim` from an empty lab_sim (see sim/control_entry.py).
+      SIM_FRESH_DB: "1"
       DEV_AUTH: "1"
       DEV_AUTH_ADMIN: "1"
       OIDC_DEV: "1"

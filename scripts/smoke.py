@@ -60,12 +60,13 @@ def main() -> None:
         project_id = created["id"]
     print("project", project_id)
     _st, envs = req("GET", API + "/environments")
+    # The hello job needs only Python; the cuda job needs the PyTorch image.
+    wanted = "pytorch" if KIND == "cuda" else "python-cpu"
     env_id = envs["environments"][0]["id"]
-    if KIND == "cuda":
-        for row in envs["environments"]:
-            if "pytorch" in row["name"]:
-                env_id = row["id"]
-                break
+    for row in envs["environments"]:
+        if wanted in row["name"]:
+            env_id = row["id"]
+            break
     example = "cuda" if KIND == "cuda" else "hello"
     src = ROOT / "examples" / example
     tmp = Path(tempfile.mkdtemp())

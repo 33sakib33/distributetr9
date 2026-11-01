@@ -9,6 +9,20 @@
 
 {$API_HOST} {
 	tls {$LAB_TLS}
+	# Metrics are for Prometheus on the internal network, not for the campus.
+	@metrics path /metrics
+	respond @metrics 404
+	# Job uploads are capped by MAX_UPLOAD_BYTES (500 MiB) in the control plane;
+	# refuse anything a good deal bigger before it is read. Raise both together.
+	@bounded not path /attempts/*/outputs/*
+	request_body @bounded {
+		max_size 600MB
+	}
+	# A PC uploads one output file at a time, up to OUTPUT_FILE_BYTES (2 GiB).
+	@outputs path /attempts/*/outputs/*
+	request_body @outputs {
+		max_size 2200MB
+	}
 	# Live logs are SSE; never buffer them.
 	reverse_proxy control:8080 {
 		flush_interval -1
@@ -26,4 +40,10 @@
 		max_size 20GB
 	}
 	reverse_proxy registry:5000
+}
+
+{$GRAFANA_HOST} {
+	tls {$LAB_TLS}
+	encode gzip
+	reverse_proxy grafana:3000
 }

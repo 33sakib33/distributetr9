@@ -26,3 +26,5 @@ portal/.env.local
 .dev/
 deploy/prod.env
 backups/
+portal/test-results/
+portal/playwright-report/

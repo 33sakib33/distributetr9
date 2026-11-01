@@ -7,11 +7,13 @@
 #   sudo bash scripts/setup-lab-node.sh --api http://10.10.126.226:8080
 #   sudo bash scripts/setup-lab-node.sh --api http://10.10.126.226:8080 --registry 10.10.126.226:5001
 #   sudo bash scripts/setup-lab-node.sh --api http://HOST:8080 --role build --gpu
+#   sudo bash scripts/setup-lab-node.sh --api http://HOST:8080 --room "Lab 204"
 set -euo pipefail
 
 API=""
 REGISTRY=""
 ROLE="train"
+ROOM=""
 EXECUTOR="docker"
 WANT_GPU=0
 AGENT_SRC=""
@@ -19,9 +21,10 @@ RESET_IDENTITY=0
 CA_CERT=""
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
   echo "Flags: --api URL  --registry HOST:PORT  --role train|build  --executor docker|auto"
-  echo "       --src DIR  --gpu  --reset-identity  -h"
+  echo "       --room NAME  --src DIR  --gpu  --reset-identity  -h"
+  echo "  --room NAME       the lab room this PC is in (shown in the portal, kept on re-runs)"
   echo "  --reset-identity  forget this PC's node id (use before imaging a disk)"
   echo "  --ca-cert FILE    trust the lab server's CA (deploy/ with LAB_TLS=internal)"
 }
@@ -31,6 +34,7 @@ while [ $# -gt 0 ]; do
     --api) API="${2:-}"; shift 2 ;;
     --registry) REGISTRY="${2:-}"; shift 2 ;;
     --role) ROLE="${2:-}"; shift 2 ;;
+    --room) ROOM="${2:-}"; shift 2 ;;
     --executor) EXECUTOR="${2:-}"; shift 2 ;;
     --src) AGENT_SRC="${2:-}"; shift 2 ;;
     --gpu) WANT_GPU=1; shift ;;
@@ -46,6 +50,11 @@ if [ -z "$API" ]; then
   exit 2
 fi
 case "$ROLE" in train|build) ;; *) echo "role must be train or build" >&2; exit 2 ;; esac
+# The room goes into config.json by hand, so keep it to characters that need no JSON escaping.
+if [ -n "$ROOM" ] && ! printf '%s' "$ROOM" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$'; then
+  echo "room must be 1-64 letters, digits, spaces, dots, dashes or underscores" >&2
+  exit 2
+fi
 case "$EXECUTOR" in docker|auto|python) ;; *) echo "executor must be docker, auto, or python" >&2; exit 2 ;; esac
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -252,12 +261,20 @@ if [ -z "$BUNDLE_KEY" ]; then
 fi
 
 install -d -m 755 /etc/lab-agent
-cat > /etc/lab-agent/config.json <<EOF
+CONFIG_JSON=/etc/lab-agent/config.json
+# Re-running without --room keeps the room the last install set.
+if [ -z "$ROOM" ] && [ -f "$CONFIG_JSON" ]; then
+  ROOM="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("room") or "")' "$CONFIG_JSON" 2>/dev/null || true)"
+  printf '%s' "$ROOM" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$' || ROOM=""
+fi
+ROOM_LINE=""
+if [ -n "$ROOM" ]; then ROOM_LINE="  \"room\": \"${ROOM}\","$'\n'; fi
+cat > "$CONFIG_JSON" <<EOF
 {
   "api_base": "${API}",
   "executor": "${EXECUTOR}",
   "role": "${ROLE}",
-  "bundle_public_key": ${BUNDLE_KEY}
+${ROOM_LINE}  "bundle_public_key": ${BUNDLE_KEY}
 }
 EOF
 chmod 644 /etc/lab-agent/config.json
