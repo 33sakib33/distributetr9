@@ -4,12 +4,13 @@ import secrets
 import time
 from urllib.parse import urlencode, urlparse
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.config import settings
 from app.db import SessionLocal
 from app.errors import AppError
+from app.ratelimit import limit_ip
 from app.identity import email_allowed, upsert_oidc_user
 from app import oidc
 from app.session_tokens import (
@@ -73,7 +74,7 @@ async def auth_config() -> dict:
     }
 
 
-@router.post("/auth/local")
+@router.post("/auth/local", dependencies=[Depends(limit_ip("login", "rate_limit_login_per_minute"))])
 async def auth_local(request: Request) -> JSONResponse:
     if not settings.dev_auth:
         raise AppError(401, "auth", "Please sign in")
@@ -96,7 +97,7 @@ async def auth_local(request: Request) -> JSONResponse:
     return resp
 
 
-@router.get("/auth/login")
+@router.get("/auth/login", dependencies=[Depends(limit_ip("login", "rate_limit_login_per_minute"))])
 async def auth_login(next: str = "/") -> RedirectResponse:
     if not settings.oidc_enabled():
         return _login_error("University login is not configured.")

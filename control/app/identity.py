@@ -12,16 +12,29 @@ def _admin_emails() -> set[str]:
     return {part.strip().lower() for part in settings.admin_emails.split(",") if part.strip()}
 
 
-def email_allowed(email: str) -> bool:
-    domains = [
+INVITE_PREFIX = "invite:"
+
+
+def allowed_domains() -> list[str]:
+    return [
         part.strip().lower().lstrip("@")
         for part in settings.oidc_allowed_email_domains.split(",")
         if part.strip()
     ]
+
+
+def email_allowed(email: str) -> bool:
+    domains = allowed_domains()
     if not domains:
         return True
     host = email.rsplit("@", 1)[-1].lower()
     return host in domains
+
+
+def is_invited(user: User) -> bool:
+    """Invited, never signed in: still the placeholder made by an invite. Every
+    sign-in (OIDC, local, dev header) replaces the placeholder subject."""
+    return user.university_sub.startswith(INVITE_PREFIX)
 
 
 async def upsert_oidc_user(

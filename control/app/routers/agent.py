@@ -5,10 +5,11 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app import agent_logs, metrics, platform_settings
 from app.agent_bundle import bootstrap_script, current_bundle, install_archive, public_key, update_for
 from app.config import settings
 from app.crypto import hash_token, new_boot_session, new_node_token
@@ -17,7 +18,7 @@ from app.deps import get_current_node
 from app.envbuild import attach_jobs_after_build, build_payload, claim_build
 from app.errors import AppError
 from app.logs import select_log_chunks
-from app.models import Artifact, EnvironmentBuild, Job, Node, NodeCredential
+from app.models import Artifact, EnvironmentBuild, Job, Node, NodeCredential, NodeEvent
 from app.scheduler import (
     _get_attempt,
     _require_token,
@@ -32,6 +33,7 @@ from app.scheduler import (
 )
 from app.schemas import BuildCompleteIn, CompleteIn, EventIn, HeartbeatIn, LogsIn, RegisterIn, RenewIn
 from app.storage import sha256_bytes, storage
+from app.telemetry import record_health
 
 router = APIRouter()
 
@@ -85,6 +87,9 @@ async def register(
             update_ring=settings.default_update_ring,
             eligibility="eligible" if body.cuda_preflight_ok else "quarantined",
             eligibility_reason=None if body.cuda_preflight_ok else _unhealthy_reason(body),
+            room=body.room,
+            room_source="agent" if body.room else None,
+            labels=[],
         )
         session.add(node)
         await session.flush()
@@ -121,6 +126,10 @@ async def register(
         node.disk_free_bytes = body.disk_free_bytes
         node.role = body.role
         node.last_heartbeat_at = now
+        # The install config names the room, but an admin's choice wins over it.
+        if body.room and (not node.room or node.room_source == "agent"):
+            node.room = body.room
+            node.room_source = "agent"
         if node.eligibility == "draining":
             pass
         elif not body.cuda_preflight_ok:
@@ -132,6 +141,11 @@ async def register(
         elif node.eligibility not in {"quarantined"}:
             node.eligibility = "eligible"
         token = presented
+    if body.last_restart is not None:
+        # Why the agent process started: kept on the node and in its event history.
+        restart = body.last_restart.model_dump(mode="json")
+        node.last_restart = restart
+        session.add(NodeEvent(node_id=node.id, kind="restart", payload=restart))
     await session.commit()
     return {
         "node_id": str(node.id),
@@ -153,10 +167,19 @@ async def heartbeat(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     now = await db_now(session)
+    await platform_settings.ensure_loaded(session)
     node.last_heartbeat_at = now
     node.disk_free_bytes = max(body.disk_linux_free_bytes, body.disk_windows_free_bytes)
     node.gpu_desktop_busy = body.gpu_desktop_busy
     node.last_health = body.model_dump(mode="json")
+    await record_health(
+        session,
+        node,
+        body.health,
+        disk_free_bytes=node.disk_free_bytes,
+        busy=body.current_attempt_id is not None or body.gpu_desktop_busy,
+        now=now,
+    )
     if body.agent_healthy is False:
         if node.eligibility not in {"draining", "quarantined"}:
             node.eligibility = "quarantined"
@@ -166,12 +189,37 @@ async def heartbeat(
     elif node.eligibility == "quarantined" and node.eligibility_reason == "agent unhealthy":
         node.eligibility = "eligible"
         node.eligibility_reason = None
+    if body.agent_healthy is not False:
+        # The offline sweep may have marked this node a moment before this heartbeat
+        # committed; undo it on the row as it is now, not on the copy loaded above.
+        await session.execute(
+            update(Node)
+            .where(Node.id == node.id, Node.eligibility == "offline")
+            .values(eligibility="eligible")
+            .execution_options(synchronize_session=False)
+        )
+    requests = agent_logs.pending_requests(node, now)
     await session.commit()
     return {
         "command": _command_for(node),
         "next_heartbeat_seconds": settings.heartbeat_interval_seconds,
+        "disk_watermark_bytes": settings.disk_watermark_bytes,
         "agent_update": update_for(node.agent_version, node.update_ring),
+        "requests": requests,
     }
+
+
+@router.post("/agent/logs-upload")
+async def upload_agent_logs(
+    request: Request,
+    node: Node = Depends(get_current_node),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """The tail of the agent's own log, sent after a heartbeat asked for it."""
+    now = await db_now(session)
+    key = agent_logs.store_upload(node, await request.body(), now)
+    await session.commit()
+    return {"object_key": key, "uploaded_at": now.isoformat()}
 
 
 @router.get("/install/lab-node.tar.gz")
@@ -228,15 +276,18 @@ async def claim_job(
             if attempt:
                 payload = await claim_payload(session, attempt)
                 await session.commit()
+                metrics.claimed("job")
                 return {"attempt": payload, "build": None}
         else:
             build = await claim_build(session, node)
             if build:
                 payload = build_payload(build)
                 await session.commit()
+                metrics.claimed("build")
                 return {"attempt": None, "build": payload}
         await session.commit()
         if waited >= settings.claim_poll_seconds:
+            metrics.claimed("empty")
             return {"attempt": None, "build": None}
         await asyncio.sleep(1.0)
         waited += 1.0
@@ -265,7 +316,13 @@ async def renew_lease(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     attempt, job = await renew(
-        session, attempt_id, body.fencing_token, body.observed_state, body.resource_usage
+        session,
+        attempt_id,
+        body.fencing_token,
+        body.observed_state,
+        body.resource_usage,
+        body.usage,
+        ([body.stage] if body.stage else []) + body.stages,
     )
     if attempt.node_id != node.id:
         raise AppError(403, "forbidden", "attempt is not on this node")

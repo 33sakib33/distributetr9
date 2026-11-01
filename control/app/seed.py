@@ -5,7 +5,12 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.catalog import PYTORCH_IMAGE, TENSORFLOW_IMAGE
+from app.catalog import (
+    PYTHON_CPU_IMAGE,
+    PYTORCH_IMAGE,
+    TENSORFLOW_IMAGE,
+    TENSORFLOW_PLACEHOLDER_IMAGE,
+)
 from app.config import settings
 from app.models import Environment, Quota, User
 
@@ -13,6 +18,7 @@ PYTORCH_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
 # Compute capabilities the catalog images are built and tested for.
 CATALOG_GPU_ARCHS = ("8.9", "8.6", "7.5", "cpu")
 TENSORFLOW_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
+PYTHON_CPU_ID = uuid.UUID("33333333-3333-3333-3333-333333333333")
 
 
 def _add_archs(env: Environment) -> None:
@@ -59,9 +65,32 @@ async def seed(session: AsyncSession) -> None:
             )
         )
     else:
-        if tensorflow.image_digest.startswith("sha256:dev"):
+        # Only the old placeholder is replaced; an image an admin pinned stays.
+        if tensorflow.image_digest.startswith("sha256:dev") or (
+            tensorflow.image_digest == TENSORFLOW_PLACEHOLDER_IMAGE
+        ):
             tensorflow.image_digest = TENSORFLOW_IMAGE
+            tensorflow.upstream_image = None
+        elif tensorflow.upstream_image == TENSORFLOW_PLACEHOLDER_IMAGE:
+            # Mirrored while it was still the placeholder: mirror the real image instead.
+            tensorflow.image_digest = TENSORFLOW_IMAGE
+            tensorflow.upstream_image = None
         _add_archs(tensorflow)
+
+    if await session.get(Environment, PYTHON_CPU_ID) is None:
+        session.add(
+            Environment(
+                id=PYTHON_CPU_ID,
+                name="python-cpu",
+                framework="python",
+                python_version="3.12",
+                cuda_version="none",
+                gpu_archs=["cpu"],
+                image_digest=PYTHON_CPU_IMAGE,
+                lockfile=None,
+                cuda_preflight_ok=True,
+            )
+        )
     await session.commit()
 
 

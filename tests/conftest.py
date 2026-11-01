@@ -46,6 +46,17 @@ os.environ["DEFAULT_PROJECT_CONCURRENCY"] = "50"
 os.environ["TOKEN_PEPPER"] = "test-token-pepper"
 os.environ["STRICT_NODE_CLASS"] = "1"
 os.environ["REGISTRY_URL"] = os.environ.get("REGISTRY_URL", "127.0.0.1:5000")
+# Mirror builds are tested by calling ensure_mirror_builds; at startup they would
+# sit in front of every builder claim the other tests make.
+os.environ["MIRROR_CATALOG_IMAGES"] = "0"
+# The alert worker would resolve alerts that tests inject straight into the table.
+os.environ["ALERT_CHECK_SECONDS"] = "3600"
+# Same for the job-notification worker: tests drive JobNotifier themselves.
+os.environ["NOTIFY_CHECK_SECONDS"] = "3600"
+
+# The suite fires far more requests from one address than the limits allow;
+# tests/test_ratelimit.py switches them on where it is the subject.
+os.environ["RATE_LIMIT_ENABLED"] = "0"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -57,3 +68,24 @@ from app.main import app
 def client():
     with TestClient(app) as test_client:
         yield test_client
+
+
+@pytest.fixture(autouse=True)
+def no_leftover_builds(client):
+    """Fail the builds a test left unfinished, before and after it. Any builder
+    claims the oldest pending build, so one test's leftover would be handed to
+    the next test's builder."""
+    from dbhelp import with_session
+    from sqlalchemy import text
+
+    async def settle(session):
+        await session.execute(
+            text(
+                "UPDATE environment_builds SET state = 'failed', finished_at = now(), "
+                "error_message = 'left over by a test' WHERE state IN ('pending', 'building', 'testing')"
+            )
+        )
+
+    asyncio.run(with_session(settle))
+    yield
+    asyncio.run(with_session(settle))

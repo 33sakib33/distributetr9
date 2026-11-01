@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from app.config import settings
@@ -187,3 +188,81 @@ def _register_body(agent: FakeAgent) -> dict:
         "disk_free_bytes": 200_000_000_000,
         "role": "train",
     }
+
+
+# --- pending reasons ignore offline nodes (X1) -----------------------------------
+
+
+async def _go_stale(node_id: str, *, mark_offline: bool) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import update
+
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    try:
+        async with AsyncSession(engine) as session:
+            values = {"last_heartbeat_at": datetime.now(timezone.utc) - timedelta(hours=1)}
+            if mark_offline:
+                values["eligibility"] = "offline"
+            await session.execute(update(Node).where(Node.id == uuid.UUID(node_id)).values(**values))
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("mark_offline", [True, False])
+async def test_stale_duplicate_node_does_not_change_the_arch_reason(client, mark_offline):
+    # A re-installed PC leaves its old row behind; it is offline, so it must not
+    # make an unsupported GPU look like it could run the job.
+    tag = f"dup-{uuid.uuid4().hex[:8]}"
+    portal = Portal(client)
+    job = portal.submit_job(gpu_class=tag, min_vram_mb=4000)
+    ghost = _agent(client, tag, "pc", cc="8.9")
+    await _go_stale(ghost.node_id, mark_offline=mark_offline)
+    _agent(client, tag, "pc", cc="6.1")
+    assert portal.get_job(job["id"])["pending_reason"] == "waiting for a GPU this environment supports"
+
+
+async def test_stale_node_with_enough_vram_does_not_hide_the_vram_reason(client):
+    tag = f"dup-{uuid.uuid4().hex[:8]}"
+    portal = Portal(client)
+    job = portal.submit_job(gpu_class=tag, min_vram_mb=16000)
+    ghost = _agent(client, tag, "big", vram=24000)
+    await _go_stale(ghost.node_id, mark_offline=True)
+    _agent(client, tag, "small", vram=8000)
+    assert portal.get_job(job["id"])["pending_reason"] == "waiting for a 16 GB GPU"
+
+
+async def test_waiting_for_the_class_when_every_node_of_it_is_offline(client):
+    tag = f"dup-{uuid.uuid4().hex[:8]}"
+    portal = Portal(client)
+    job = portal.submit_job(gpu_class=tag)
+    node = _agent(client, tag, "pc")
+    await _go_stale(node.node_id, mark_offline=False)
+    assert portal.get_job(job["id"])["pending_reason"] == f"waiting for node class {tag}"
+    node.heartbeat()
+    attempt = node.claim()
+    assert attempt is not None and attempt["job_id"] == job["id"]
+    node.run_to_complete(attempt)
+
+
+def test_is_online_needs_a_fresh_heartbeat_and_not_offline_or_decommissioned():
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from app.scheduler import is_online
+
+    now = datetime.now(timezone.utc)
+
+    def node(**kw):
+        return SimpleNamespace(
+            **{"eligibility": "eligible", "last_heartbeat_at": now, "decommissioned_at": None, **kw}
+        )
+
+    assert is_online(node(), now)
+    assert is_online(node(eligibility="draining"), now)
+    assert not is_online(node(eligibility="offline"), now)
+    assert not is_online(node(last_heartbeat_at=None), now)
+    assert not is_online(node(last_heartbeat_at=now - timedelta(hours=1)), now)
+    assert not is_online(node(decommissioned_at=now), now)
+    assert is_online(node(decommissioned_at=None), now)

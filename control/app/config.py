@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     public_base_url: str = "http://127.0.0.1:8080"
     portal_base_url: str = "http://127.0.0.1:3000"
     registry_url: str = ""
+    # With REGISTRY_URL set, copy catalog images into the lab registry (mirror builds).
+    mirror_catalog_images: bool = True
 
     dev_auth: bool = True
     dev_auth_admin: bool = True
@@ -30,6 +32,9 @@ class Settings(BaseSettings):
     oidc_dev: bool = True
     session_hours: int = 12
     session_secure: bool = False
+
+    # GET /availability lists only classes with a train PC heard from this recently.
+    availability_class_max_age_days: int = 7
 
     lease_ttl_seconds: int = 30
     heartbeat_interval_seconds: int = 10
@@ -62,7 +67,33 @@ class Settings(BaseSettings):
     agent_rollout_ring: int = 2
     default_update_ring: int = 2
     alert_webhook_url: str = ""
+    # With a token set, GET /metrics needs "Authorization: Bearer <token>".
+    metrics_token: str = ""
+    # Class-hour windows (availability schedules) are written in this IANA zone.
+    lab_timezone: str = "UTC"
+    # Job-finished e-mail goes out through this SMTP server; empty SMTP_HOST turns e-mail off.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = "lab@localhost"
+    smtp_starttls: bool = True
+    # How often the notification worker looks for finished jobs, and how often one job is tried.
+    notify_check_seconds: int = 15
+    notify_max_tries: int = 3
+    # Webhooks may only reach public addresses (a user chooses the URL, the server
+    # sends it); set 1 to allow a webhook receiver on the lab network.
+    notify_allow_private_webhooks: bool = False
+    # Rate limits (requests a minute per user, or per IP when nobody is signed in).
+    rate_limit_enabled: bool = True
+    rate_limit_jobs_per_minute: int = 30
+    rate_limit_inspect_per_minute: int = 30
+    rate_limit_login_per_minute: int = 10
+    rate_limit_client_errors_per_minute: int = 20
+    # "text" for a developer's terminal, "json" (one object per line) for the server.
+    log_format: str = "text"
     alert_cooldown_seconds: int = 3600
+    alert_check_seconds: int = 60
     alert_offline_seconds: int = 600
     alert_lease_losses_per_hour: int = 5
     alert_node_failures: int = 3

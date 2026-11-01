@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -17,9 +17,13 @@ from app.enums import (
     RETRYABLE_FAILURES,
     TERMINAL_ATTEMPT_STATES,
 )
+from app import metrics, platform_settings
 from app.errors import AppError
 from app.models import Artifact, Environment, EnvironmentBuild, Job, JobAttempt, Node, Quota
+from app.schedule import Schedule, load_schedule
+from app.schemas import StageIn, UsageIn
 from app.storage import storage
+from app.telemetry import apply_stages, enter_uploading, record_usage
 
 
 def _resources(job: Job) -> dict[str, Any]:
@@ -195,12 +199,23 @@ def _heartbeat_fresh(node: Node, now: datetime) -> bool:
     return (now - hb) <= limit
 
 
+def is_online(node: Node, now: datetime) -> bool:
+    """A node that could take work if it were free: heartbeating, and neither
+    marked offline nor decommissioned. Pending reasons ignore all others, so a
+    stale duplicate row of a re-installed PC can not change them."""
+    if node.decommissioned_at is not None:
+        return False
+    return node.eligibility != "offline" and _heartbeat_fresh(node, now)
+
+
 def is_train_node(node: Node) -> bool:
     role = (getattr(node, "role", None) or "train").strip().lower()
     return role != "build"
 
 
-def node_can_claim(node: Node, now: datetime) -> str | None:
+def node_can_claim(node: Node, now: datetime, schedule: Schedule | None = None) -> str | None:
+    if node.decommissioned_at is not None:
+        return "decommissioned"
     if node.eligibility in {"draining", "quarantined"}:
         return node.eligibility
     if node.eligibility == "offline" or not _heartbeat_fresh(node, now):
@@ -214,6 +229,8 @@ def node_can_claim(node: Node, now: datetime) -> str | None:
         return "disk"
     if is_outdated(node.agent_version):
         return "outdated"
+    if schedule is not None and schedule.blocked(node):
+        return "schedule"
     return None
 
 
@@ -242,7 +259,9 @@ async def claim(session: AsyncSession, node: Node) -> JobAttempt | None:
     existing = await _active_attempt_for_node(session, node.id)
     if existing:
         return existing
-    blocked = node_can_claim(node, now)
+    await platform_settings.ensure_loaded(session)
+    schedule = await load_schedule(session)
+    blocked = node_can_claim(node, now, schedule)
     if blocked:
         return None
 
@@ -280,6 +299,8 @@ async def claim(session: AsyncSession, node: Node) -> JobAttempt | None:
             continue
         if not node_fits_job(node, job, env):
             continue
+        if schedule.collision(node, job.max_runtime_seconds):
+            continue  # would still be running when the room closes for class
         if await _quota_reason(session, job):
             continue
         if reserved_skip(node, job, now, list(jobs)):
@@ -317,6 +338,7 @@ async def claim(session: AsyncSession, node: Node) -> JobAttempt | None:
         async with session.begin_nested():
             session.add(attempt)
             await session.flush()
+        metrics.attempt_created(session, chosen.created_at, attempt.attempt_number, now)
         return attempt
     except IntegrityError:
         existing = await _active_attempt_for_node(session, node.id)
@@ -331,8 +353,9 @@ async def explain_pending(session: AsyncSession, job: Job) -> str | None:
     status = derived_status(job)
     if status != "queued":
         return job.pending_reason
+    await platform_settings.ensure_loaded(session)
     now = await db_now(session)
-    nodes = (await session.scalars(select(Node))).all()
+    nodes = [n for n in (await session.scalars(select(Node))).all() if is_online(n, now)]
     gpu_class = _resources(job).get("gpu_class")
     class_nodes = [
         n
@@ -359,7 +382,15 @@ async def explain_pending(session: AsyncSession, job: Job) -> str | None:
     quota_reason = await _quota_reason(session, job)
     if quota_reason:
         return quota_reason
-    claimable = [n for n in fitting if node_can_claim(n, now) is None]
+    usable = [n for n in fitting if node_can_claim(n, now) is None]
+    schedule = await load_schedule(session)
+    closed = schedule.reserved_reason(usable)
+    if closed:
+        return closed
+    opens = [start for n in usable if (start := schedule.collision(n, job.max_runtime_seconds)) is not None]
+    if usable and len(opens) == len(usable):
+        return f"lab reserved for teaching from {min(opens):%H:%M}; lower the max runtime to start sooner"
+    claimable = usable
     queued = (
         await session.scalars(
             select(Job).where(Job.desired_state == "run", Job.accepted_attempt_id.is_(None))
@@ -398,6 +429,8 @@ async def renew(
     token: uuid.UUID,
     observed_state: str | None,
     resource_usage: dict | None,
+    usage: UsageIn | None = None,
+    stages: list[StageIn] | None = None,
 ) -> tuple[JobAttempt, Job]:
     attempt = await _get_attempt(session, attempt_id)
     _require_token(attempt, token)
@@ -427,6 +460,10 @@ async def renew(
     attempt.lease_expires_at = now + timedelta(seconds=settings.lease_ttl_seconds)
     if resource_usage is not None:
         attempt.resource_usage = resource_usage
+    if stages:
+        apply_stages(attempt, stages, now, session)
+    if usage is not None:
+        await record_usage(session, attempt, usage, now)
     return attempt, job
 
 
@@ -445,6 +482,8 @@ def _apply_transition(attempt: JobAttempt, new_state: str, now: datetime) -> Non
     attempt.observed_state = new_state
     if new_state in {"starting", "running"} and attempt.started_at is None:
         attempt.started_at = now
+    if new_state == "uploading":
+        enter_uploading(attempt, now)
     if new_state in TERMINAL_ATTEMPT_STATES:
         attempt.completed_at = now
 
@@ -478,6 +517,8 @@ async def request_cancel(session: AsyncSession, job_id: uuid.UUID) -> Job:
     attempt = await _active_attempt_for_job(session, job.id)
     now = await db_now(session)
     if attempt is None:
+        if job.completed_at is None:
+            metrics.job_finished(session, "cancelled")
         job.completed_at = now
         job.pending_reason = None
         return job
@@ -548,6 +589,8 @@ async def complete(
         job.accepted_attempt_id = attempt.id
         job.completed_at = now
         job.pending_reason = None
+        metrics.attempt_ended(session, attempt.started_at, now)
+        metrics.job_finished(session, "cancelled")
         payload = {
             "accepted": False,
             "status": "cancelled",
@@ -575,6 +618,7 @@ async def complete(
         job.completed_at = now
         job.pending_reason = None
         status = "completed"
+        metrics.job_finished(session, "completed")
     else:
         if attempt.failure_category == "timeout":
             category = "timeout"
@@ -599,7 +643,9 @@ async def complete(
             job.completed_at = now
             job.pending_reason = None
             status = "failed" if attempt.observed_state == "failed" else "cancelled"
+            metrics.job_finished(session, status)
 
+    metrics.attempt_ended(session, attempt.started_at, now)
     payload = {
         "accepted": True,
         "status": status,
@@ -634,7 +680,9 @@ async def expire_leases(session: AsyncSession) -> None:
                 job.accepted_attempt_id = attempt.id
                 job.completed_at = now
                 job.pending_reason = None
+                metrics.job_finished(session, "cancelled")
                 continue
+            metrics.lease_lost(session)
             await _fail_attempt(session, job, attempt, "lease_lost", now)
 
 
@@ -663,6 +711,7 @@ async def _fail_attempt(
         job.accepted_attempt_id = attempt.id
         job.completed_at = now
         job.pending_reason = None
+        metrics.job_finished(session, "failed")
 
 
 async def on_node_boot(session: AsyncSession, node_id: uuid.UUID) -> None:
@@ -681,15 +730,24 @@ async def on_node_boot(session: AsyncSession, node_id: uuid.UUID) -> None:
 
 
 async def mark_offline_nodes(session: AsyncSession) -> None:
+    """Flip nodes between offline and eligible by heartbeat age. Both are single
+    UPDATEs that test the heartbeat in their WHERE clause: a heartbeat landing
+    while this runs must not be overwritten by a decision made on its old value."""
     now = await db_now(session)
-    nodes = (await session.scalars(select(Node))).all()
-    for node in nodes:
-        if node.eligibility in {"draining", "quarantined"}:
-            continue
-        if not _heartbeat_fresh(node, now):
-            node.eligibility = "offline"
-        elif node.eligibility == "offline":
-            node.eligibility = "eligible"
+    cutoff = now - timedelta(seconds=settings.heartbeat_interval_seconds * 3)
+    fleet = (Node.decommissioned_at.is_(None), Node.eligibility.not_in(("draining", "quarantined")))
+    await session.execute(
+        update(Node)
+        .where(*fleet, Node.eligibility != "offline", or_(Node.last_heartbeat_at.is_(None), Node.last_heartbeat_at < cutoff))
+        .values(eligibility="offline")
+        .execution_options(synchronize_session=False)
+    )
+    await session.execute(
+        update(Node)
+        .where(*fleet, Node.eligibility == "offline", Node.last_heartbeat_at >= cutoff)
+        .values(eligibility="eligible")
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def claim_payload(session: AsyncSession, attempt: JobAttempt) -> dict[str, Any]:

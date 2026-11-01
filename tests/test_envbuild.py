@@ -312,3 +312,40 @@ def test_expired_build_is_rebuilt_on_demand(client):
     assert again["status"] == "building"
     rebuild = client.post("/agent/claim", json={}, headers=builder._headers()).json()["build"]
     assert rebuild["build_id"] == build["build_id"]
+
+
+def test_cpu_builder_serves_any_gpu_class(client):
+    # One builder (here with no GPU at all) builds for every compatibility class.
+    tag = f"turing-6g-{uuid.uuid4().hex[:8]}"
+    req = f"pkg-{uuid.uuid4().hex[:10]}==1.0.0\n"
+    portal = Portal(client)
+    job = portal.submit_job(gpu_class=tag, min_vram_mb=1000, requirements=req)
+    assert job["status"] == "building"
+
+    builder = FakeAgent(
+        client,
+        hostname=f"cpu-builder-{tag}",
+        caps={"compatibility_class": "cpu", "gpu_model": "none", "vram_total_mb": 0, "vram_allocatable_mb": 0},
+        role="build",
+    )
+    builder.register()
+    builder.heartbeat()
+    build = client.post("/agent/claim", json={}, headers=builder._headers()).json()["build"]
+    assert build is not None
+    assert build["compat_class"] == tag
+    assert build["need_cuda"] is True
+    done = client.post(
+        f"/agent/builds/{build['build_id']}/complete",
+        json={"ok": True, "image_digest": READY_DIGEST, "lockfile": req, "log": "built on a cpu builder"},
+        headers=builder._headers(),
+    )
+    assert done.json()["state"] == "ready"
+
+    trainer = FakeAgent(client, hostname=f"t-{tag}", caps=_caps(tag, 6144), role="train")
+    trainer.register()
+    trainer.heartbeat()
+    attempt = trainer.claim()
+    assert attempt is not None
+    assert attempt["job_id"] == job["id"]
+    assert attempt["image_digest"] == READY_DIGEST
+    trainer.run_to_complete(attempt)

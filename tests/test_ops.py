@@ -33,7 +33,7 @@ def test_admin_alerts_endpoint(client, monkeypatch):
 
     resp = client.get("/admin/alerts", headers=ADMIN)
     assert resp.status_code == 200
-    assert isinstance(resp.json()["alerts"], list)
+    assert isinstance(resp.json()["groups"], list)
     monkeypatch.setattr(settings, "dev_auth_admin", False)
     student = {"X-Dev-User": f"student-{uuid.uuid4().hex[:6]}@uni.edu"}
     assert client.get("/admin/alerts", headers=student).status_code == 403

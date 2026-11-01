@@ -18,6 +18,7 @@ from pathlib import Path
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
+from app import platform_settings
 from app.config import settings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -151,17 +152,19 @@ def parse_version(value: str | None) -> tuple[int, ...] | None:
 
 
 def target_version() -> str | None:
-    if settings.agent_target_version:
-        return settings.agent_target_version
+    pinned = platform_settings.target_version()
+    if pinned:
+        return pinned
     bundle = current_bundle()
     return bundle.version if bundle else None
 
 
 def is_outdated(agent_version: str | None) -> bool:
-    """True when a real agent is below AGENT_MIN_VERSION. Unparsable versions
-    (harness agents) are never blocked."""
+    """True when a real agent is below the minimum version (the rollout setting,
+    else AGENT_MIN_VERSION). Unparsable versions (harness agents) are never blocked."""
     have = parse_version(agent_version)
-    floor = parse_version(settings.agent_min_version) if settings.agent_min_version else None
+    minimum = platform_settings.min_version()
+    floor = parse_version(minimum) if minimum else None
     return bool(have and floor and have < floor)
 
 
@@ -174,6 +177,6 @@ def update_for(agent_version: str | None, update_ring: int) -> dict | None:
         return None
     if parse_version(agent_version) is None or agent_version == target:
         return None
-    if update_ring > settings.agent_rollout_ring:
+    if update_ring > platform_settings.rollout_ring():
         return None
     return {"version": bundle.version, "sha256": bundle.sha256, "url": "/agent/bundle"}

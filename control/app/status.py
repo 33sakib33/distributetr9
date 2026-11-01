@@ -41,7 +41,8 @@ def derived_status(job: Job) -> str:
             return "queued"
         return "failed"
     if attempt.observed_state == "cancelled":
-        return "cancelled"
+        # An admin requeue turns a cancelled job back to run with its old attempt in place.
+        return "cancelled" if job.desired_state == "cancel" else "queued"
     if attempt.observed_state == "completed":
         return "completed"
     if attempt.observed_state == "unknown":

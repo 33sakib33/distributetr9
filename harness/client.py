@@ -38,7 +38,7 @@ class FakeAgent:
             "X-Boot-Session-Id": self.boot_session_id,
         }
 
-    def register(self, *, reuse: bool = True) -> dict:
+    def register(self, *, reuse: bool = True, last_restart: dict | None = None, room: str | None = None) -> dict:
         body = {
             "node_id": self.node_id if reuse else None,
             "hostname": self.hostname,
@@ -59,6 +59,10 @@ class FakeAgent:
             "cuda_preflight_ok": True,
             "role": self.role,
         }
+        if last_restart is not None:
+            body["last_restart"] = last_restart
+        if room is not None:
+            body["room"] = room
         headers = {}
         if reuse and self.token and self.node_id:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -72,20 +76,31 @@ class FakeAgent:
         self.boot_session_id = payload["boot_session_id"]
         return payload
 
-    def heartbeat(self, attempt_id: str | None = None) -> dict:
-        resp = self.client.post(
-            "/agent/heartbeat",
-            json={
-                "disk_linux_free_bytes": 200_000_000_000,
-                "disk_windows_free_bytes": 200_000_000_000,
-                "gpu_desktop_busy": False,
-                "current_attempt_id": attempt_id,
-                "agent_healthy": True,
-            },
-            headers=self._headers(),
-        )
+    def heartbeat(self, attempt_id: str | None = None, *, health: dict | None = None) -> dict:
+        body = {
+            "disk_linux_free_bytes": 200_000_000_000,
+            "disk_windows_free_bytes": 200_000_000_000,
+            "gpu_desktop_busy": False,
+            "current_attempt_id": attempt_id,
+            "agent_healthy": True,
+        }
+        if health is not None:
+            body["health"] = health
+        resp = self.client.post("/agent/heartbeat", json=body, headers=self._headers())
         assert resp.status_code == 200, resp.text
         return resp.json()
+
+    def upload_logs(self, text: str) -> dict:
+        resp = self.client.post(
+            "/agent/logs-upload",
+            content=text.encode(),
+            headers={**self._headers(), "Content-Type": "text/plain"},
+        )
+        try:
+            body = resp.json()
+        except Exception:
+            body = {"raw": resp.text}
+        return {"status_code": resp.status_code, "body": body}
 
     def claim(self) -> dict | None:
         resp = self.client.post("/agent/claim", json={}, headers=self._headers())
@@ -108,11 +123,24 @@ class FakeAgent:
         )
         return {"status_code": resp.status_code, "body": resp.json()}
 
-    def renew(self, attempt: dict, state: str = "running") -> dict:
+    def renew(
+        self,
+        attempt: dict,
+        state: str = "running",
+        *,
+        usage: dict | None = None,
+        stage: dict | None = None,
+        stages: list[dict] | None = None,
+    ) -> dict:
+        body = {"fencing_token": attempt["fencing_token"], "observed_state": state}
+        if usage is not None:
+            body["usage"] = usage
+        if stage is not None:
+            body["stage"] = stage
+        if stages:
+            body["stages"] = stages
         resp = self.client.post(
-            f"/attempts/{attempt['attempt_id']}/renew",
-            json={"fencing_token": attempt["fencing_token"], "observed_state": state},
-            headers=self._headers(),
+            f"/attempts/{attempt['attempt_id']}/renew", json=body, headers=self._headers()
         )
         return {"status_code": resp.status_code, "body": resp.json()}
 

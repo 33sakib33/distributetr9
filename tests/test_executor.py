@@ -120,3 +120,129 @@ def test_silent_job_can_be_cancelled(tmp_path):
     )
     assert category == "cancelled"
     assert time.time() - start < 8
+
+
+def test_cuda_check_needs_a_matching_gpu_on_the_builder():
+    from agent.executor import should_check_cuda
+
+    check = lambda **kw: should_check_cuda(**{"need_cuda": True, "has_gpu": True, **kw})  # noqa: E731
+    assert check(build_class="turing-6g", builder_class="turing-6g")
+    assert not check(build_class="turing-6g", builder_class="ada-12g")
+    assert not check(build_class="turing-6g", builder_class="cpu")
+    assert not check(build_class="turing-6g", builder_class="turing-6g", has_gpu=False)
+    assert not check(build_class="turing-6g", builder_class=None)
+    assert not check(build_class="cpu", builder_class="cpu", need_cuda=False)
+
+
+def _fake_docker(monkeypatch, calls: list[list[str]]):
+    import subprocess
+
+    from agent import executor
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        out = "numpy==1.26.4\n" if cmd[:2] == ["docker", "run"] else ""
+        if cmd[:3] == ["docker", "image", "inspect"] and "--format" in cmd:
+            out = "reg:5000/lab-env/abc@sha256:" + "ab" * 32 + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    return executor
+
+
+def test_build_without_the_gpu_skips_the_cuda_check(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+    executor = _fake_docker(monkeypatch, calls)
+    monkeypatch.setattr(executor, "nvidia_smi_ok", lambda: True)
+    result = executor.build_custom_image(
+        base_image="pytorch/pytorch:2.5.1",
+        image_tag="reg:5000/lab-env/abc",
+        requirements="numpy==1.26.4\n",
+        need_cuda=True,
+        work_dir=tmp_path,
+        build_class="turing-6g",
+        builder_class="ada-12g",
+    )
+    assert result["ok"], result
+    assert "cuda check skipped: builder has no turing-6g GPU" in result["log"]
+    test_run = next(c for c in calls if c[:2] == ["docker", "run"])
+    assert "--gpus" not in test_run
+    assert "assert torch.cuda.is_available()" not in test_run[-1]
+    assert "import_module('numpy')" in test_run[-1]  # the import test still runs
+
+
+def test_build_on_a_matching_gpu_checks_cuda(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+    executor = _fake_docker(monkeypatch, calls)
+    monkeypatch.setattr(executor, "nvidia_smi_ok", lambda: True)
+    result = executor.build_custom_image(
+        base_image="pytorch/pytorch:2.5.1",
+        image_tag="reg:5000/lab-env/abc",
+        requirements="numpy==1.26.4\n",
+        need_cuda=True,
+        work_dir=tmp_path,
+        build_class="turing-6g",
+        builder_class="turing-6g",
+    )
+    assert result["ok"], result
+    assert "cuda check skipped" not in result["log"]
+    test_run = next(c for c in calls if c[:2] == ["docker", "run"])
+    assert "--gpus" in test_run
+    assert "assert torch.cuda.is_available()" in test_run[-1]
+
+
+def test_split_ref_handles_registry_ports_and_digests():
+    from agent.executor import normalize_ref, split_ref
+
+    assert split_ref("reg:5000/lab/x:1.0") == ("reg:5000/lab/x", ":1.0")
+    assert split_ref("reg:5000/lab/x") == ("reg:5000/lab/x", "")
+    assert split_ref("ubuntu:22.04") == ("ubuntu", ":22.04")
+    assert split_ref("reg:5000/lab/x@sha256:" + "a" * 64) == ("reg:5000/lab/x", "@sha256:" + "a" * 64)
+    assert normalize_ref("reg:5000/lab-env/abc") == "reg:5000/lab-env/abc:latest"
+
+
+def test_mirror_digest_is_the_one_for_the_pushed_repository():
+    from agent.executor import pick_repo_digest
+
+    tag = "reg:5000/lab/python-cpu:3.12.7-slim"
+    mine = "reg:5000/lab/python-cpu@sha256:" + "ab" * 32
+    hub = "python@sha256:" + "cd" * 32
+    # A pulled image lists the digest it came from first; index 0 would be wrong.
+    assert pick_repo_digest([hub, mine], tag) == mine
+    assert pick_repo_digest([hub], tag) is None
+    assert pick_repo_digest([], tag) is None
+
+
+def test_mirror_image_pulls_tags_pushes_and_returns_registry_digest(monkeypatch):
+    import subprocess
+
+    from agent import executor
+
+    calls: list[list[str]] = []
+    mine = "reg:5000/lab/python-cpu@sha256:" + "ab" * 32
+    hub = "python@sha256:" + "cd" * 32
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        out = '["%s","%s"]' % (hub, mine) if "{{json .RepoDigests}}" in cmd else ""
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    result = executor.mirror_image(source_image="python:3.12.7-slim", image_tag="reg:5000/lab/python-cpu:3.12.7-slim")
+    assert result["ok"] and result["image_digest"] == mine
+    assert [c[1] for c in calls[:3]] == ["pull", "tag", "push"]
+    assert calls[1] == ["docker", "tag", "python:3.12.7-slim", "reg:5000/lab/python-cpu:3.12.7-slim"]
+
+
+def test_mirror_image_reports_a_failed_push(monkeypatch):
+    import subprocess
+
+    from agent import executor
+
+    def fake_run(cmd, **kwargs):
+        failed = cmd[1] == "push"
+        return subprocess.CompletedProcess(cmd, 1 if failed else 0, stdout="", stderr="denied" if failed else "")
+
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+    result = executor.mirror_image(source_image="python:3.12", image_tag="reg:5000/lab/p:3.12")
+    assert not result["ok"] and result["error"] == "denied"

@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 from app.errors import AppError
 from app.models import Job, JobAttempt, Node
 from app.status import derived_status, latest_attempt, timings
+from app.telemetry import stages_for
 
 router = APIRouter()
 
@@ -29,6 +30,9 @@ def serialize_attempt(attempt: JobAttempt | None, node: Node | None = None) -> d
         "started_at": attempt.started_at.isoformat() if attempt.started_at else None,
         "completed_at": attempt.completed_at.isoformat() if attempt.completed_at else None,
         "last_log_seq": attempt.last_log_seq,
+        "peak_vram_mb": attempt.peak_vram_mb,
+        "peak_ram_mb": attempt.peak_ram_mb,
+        "avg_gpu_pct": attempt.avg_gpu_pct,
     }
     if node is not None:
         payload["hostname"] = node.hostname
@@ -56,6 +60,7 @@ def serialize_job(job: Job, node: Node | None = None) -> dict:
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "timings": timings(job, now),
         "latest_attempt": serialize_attempt(attempt, node),
+        "stages": stages_for(attempt),
     }
 
 

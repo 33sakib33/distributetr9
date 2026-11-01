@@ -145,8 +145,12 @@ def test_launcher_rolls_back_a_crashing_release(tmp_path):
     env = dict(os.environ, LAB_AGENT_ROOT=str(tmp_path), LAB_AGENT_RESTART_DELAY="0")
     proc = subprocess.Popen(["bash", str(launcher)], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
+        # The launcher switches the link first, then records the rejection and drops
+        # `pending`; wait for the last step so the asserts do not catch it halfway.
         deadline = time.time() + 15
-        while time.time() < deadline and os.readlink(tmp_path / "current") != "releases/0.6.0":
+        while time.time() < deadline and (
+            os.readlink(tmp_path / "current") != "releases/0.6.0" or (tmp_path / "pending").exists()
+        ):
             time.sleep(0.2)
         assert os.readlink(tmp_path / "current") == "releases/0.6.0"
         assert (tmp_path / "rejected").read_text().split() == ["0.7.0"]

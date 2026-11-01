@@ -11,6 +11,8 @@ from app.config import settings
 from app.crypto import hash_token
 from app.db import get_session
 from app.errors import AppError
+from app.identity import is_invited
+from app.observability import note
 from app.models import Job, Node, NodeCredential, ProjectMember, User
 from app.seed import ensure_user_quota
 from app.session_tokens import SESSION_PREFIX, read_session
@@ -21,6 +23,9 @@ async def _user_from_dev_header(session: AsyncSession, x_dev_user: str | None) -
         return None
     email = x_dev_user.strip().lower()
     user = await session.scalar(select(User).where(User.email == email))
+    if user is not None and is_invited(user):
+        user.university_sub = f"dev:{email}"  # first sign-in claims the invite
+        await session.commit()
     if user is None:
         user = User(
             university_sub=f"dev:{email}",
@@ -58,12 +63,14 @@ async def get_current_user(
                 raise AppError(401, "auth", "session user not found")
             if user.disabled_at is not None:
                 raise AppError(403, "disabled", "user is disabled")
+            note(user=user.email)
             return user
 
     user = await _user_from_dev_header(session, x_dev_user)
     if user is not None:
         if user.disabled_at is not None:
             raise AppError(403, "disabled", "user is disabled")
+        note(user=user.email)
         return user
 
     raise AppError(401, "auth", "Please sign in")
@@ -137,4 +144,5 @@ async def get_current_node(
             "boot session mismatch; re-register",
             node_id=str(node.id),
         )
+    note(node=node.hostname)
     return node

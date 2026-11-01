@@ -7,6 +7,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -38,6 +39,11 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(Text, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Job-finished notifications (B26): e-mail on by default, webhook only when set.
+    notify_email: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    notify_webhook_url: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -99,9 +105,118 @@ class Node(Base):
     update_ring: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("2"))
     gpu_desktop_busy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_health: Mapped[dict | None] = mapped_column(JSONB)
+    last_restart: Mapped[dict | None] = mapped_column(JSONB)
+    # Forgotten PCs keep their history but leave the fleet, the scheduler, alerts and metrics (B15).
+    decommissioned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Where the PC sits (B16). `room_source` says who set it: the agent's config or an admin.
+    room: Mapped[str | None] = mapped_column(Text)
+    room_source: Mapped[str | None] = mapped_column(String(16))
+    labels: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb"))
+    # Agent log on demand (B13): an admin asks, the next heartbeat carries the
+    # request, the agent uploads its log tail to `logs_object_key`.
+    logs_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    logs_request_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    logs_uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    logs_object_key: Mapped[str | None] = mapped_column(Text)
     registered_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class AlertRecord(Base):
+    """One alert key and its lifecycle: open, acknowledged or muted, resolved, re-opened."""
+
+    __tablename__ = "alerts"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
+    key: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    first_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledged_by: Mapped[str | None] = mapped_column(Text)
+    muted_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the webhook last announced it; reset when the alert re-opens.
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AvailabilityWindow(Base):
+    """A weekly window in LAB_TIMEZONE when a room or one PC is closed to jobs
+    (class hours, B17). Exactly one of `room` and `node_id` is set."""
+
+    __tablename__ = "availability_windows"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
+    room: Mapped[str | None] = mapped_column(Text)
+    node_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("nodes.id"))
+    weekday: Mapped[int] = mapped_column(Integer, nullable=False)  # Monday = 0
+    start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class PlatformSetting(Base):
+    """Operator-editable settings that override the environment defaults (B20)."""
+
+    __tablename__ = "platform_settings"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[object] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_by: Mapped[str | None] = mapped_column(Text)
+
+
+class AuditLog(Base):
+    """Who did what to what, for every admin mutation (B21)."""
+
+    __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_log_at", "at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    actor_user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    actor_email: Mapped[str] = mapped_column(Text, nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    target_type: Mapped[str] = mapped_column(Text, nullable=False)
+    target_id: Mapped[str | None] = mapped_column(Text)
+    details: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class NodeEvent(Base):
+    __tablename__ = "node_events"
+    __table_args__ = (Index("ix_node_events_node_at", "node_id", "at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
+    node_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class NodeHealth(Base):
+    """One throttled heartbeat sample per node (at most one a minute)."""
+
+    __tablename__ = "node_health"
+    __table_args__ = (Index("ix_node_health_node_at", "node_id", "at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
+    node_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("nodes.id"), nullable=False)
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    gpu_temp_c: Mapped[float | None] = mapped_column(Float)
+    gpu_pct: Mapped[float | None] = mapped_column(Float)
+    disk_free_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    busy: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class NodeCredential(Base):
@@ -127,6 +242,10 @@ class Environment(Base):
     image_digest: Mapped[str] = mapped_column(Text, nullable=False)
     lockfile: Mapped[str | None] = mapped_column(Text)
     cuda_preflight_ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # The public image a catalog row was mirrored from (see envbuild mirror builds).
+    upstream_image: Mapped[str | None] = mapped_column(Text)
+    # A retired catalog image is hidden and can not be chosen; jobs already using it keep running (B19).
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -137,6 +256,11 @@ class EnvironmentBuild(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
     environment_hash: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    # "pip" builds a custom environment; "mirror" copies a catalog image into the lab registry.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pip", server_default=text("'pip'")
+    )
+    environment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("environments.id"))
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     base_image: Mapped[str] = mapped_column(Text, nullable=False)
     spec: Mapped[str | None] = mapped_column(Text)
@@ -196,6 +320,9 @@ class Job(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When the owner was told the job finished; `notify_tries` counts failed deliveries.
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notify_tries: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
 
     attempts: Mapped[list[JobAttempt]] = relationship(
         back_populates="job",
@@ -241,6 +368,11 @@ class JobAttempt(Base):
     last_log_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     log_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     resource_usage: Mapped[dict | None] = mapped_column(JSONB)
+    # {"<stage>": {"started_at", "finished_at", "progress"}} reported by the agent (see telemetry.py).
+    stages: Mapped[dict | None] = mapped_column(JSONB)
+    peak_vram_mb: Mapped[int | None] = mapped_column(Integer)
+    peak_ram_mb: Mapped[int | None] = mapped_column(Integer)
+    avg_gpu_pct: Mapped[float | None] = mapped_column(Float)
     completion_payload: Mapped[dict | None] = mapped_column(JSONB)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -249,6 +381,23 @@ class JobAttempt(Base):
     )
 
     job: Mapped[Job] = relationship(back_populates="attempts", foreign_keys=[job_id])
+
+
+class AttemptUsage(Base):
+    """A resource sample the agent sent with a lease renewal."""
+
+    __tablename__ = "attempt_usage"
+    __table_args__ = (Index("ix_attempt_usage_attempt_at", "attempt_id", "at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_id)
+    attempt_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("job_attempts.id"), nullable=False)
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    gpu_pct: Mapped[float | None] = mapped_column(Float)
+    vram_mb: Mapped[int | None] = mapped_column(Integer)
+    cpu_pct: Mapped[float | None] = mapped_column(Float)
+    ram_mb: Mapped[int | None] = mapped_column(Integer)
 
 
 class Artifact(Base):

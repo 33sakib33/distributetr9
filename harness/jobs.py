@@ -21,6 +21,13 @@ class Portal:
         self.client = client
         self.email = email or f"harness-{uuid.uuid4().hex[:8]}@uni.edu"
         self.headers = {"X-Dev-User": self.email}
+        self._project_id: str | None = None
+
+    def project_id(self) -> str:
+        """The user's one project, created on first use."""
+        if self._project_id is None:
+            self._project_id = self.ensure_project()
+        return self._project_id
 
     def ensure_project(self, name: str | None = None) -> str:
         name = name or f"p-{uuid.uuid4().hex[:8]}"
@@ -33,10 +40,14 @@ class Portal:
         assert projects, listed.text
         return projects[0]["id"]
 
-    def environment_id(self) -> str:
+    def environment_id(self, name: str = "pytorch-stable-cu124") -> str:
         resp = self.client.get("/environments", headers=self.headers)
         assert resp.status_code == 200, resp.text
-        return resp.json()["environments"][0]["id"]
+        environments = resp.json()["environments"]
+        for env in environments:
+            if env["name"] == name:
+                return env["id"]
+        return environments[0]["id"]
 
     def submit_job(
         self,
@@ -48,8 +59,9 @@ class Portal:
         requirements: str | None = None,
         disk_mb: int | None = None,
         idempotency_key: str | None = None,
+        project_id: str | None = None,
     ) -> dict:
-        project_id = self.ensure_project()
+        project_id = project_id or self.ensure_project()
         data = {
             "project_id": project_id,
             "entrypoint": "train.py",

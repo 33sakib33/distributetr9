@@ -98,7 +98,9 @@ async def gc(days: int, dry_run: bool) -> tuple[int, list[str]]:
 
 async def status() -> None:
     async with SessionLocal() as session:
-        nodes = (await session.scalars(select(Node).order_by(Node.hostname))).all()
+        nodes = (
+            await session.scalars(select(Node).where(Node.decommissioned_at.is_(None)).order_by(Node.hostname))
+        ).all()
         queued = await session.scalar(
             select(func.count()).select_from(Job).where(Job.desired_state == "run", Job.accepted_attempt_id.is_(None))
         )

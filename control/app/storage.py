@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+from collections.abc import Iterator
 from datetime import timedelta
 
 from minio import Minio
@@ -42,6 +43,15 @@ class Storage:
         response = self.client.get_object(self.bucket, key)
         try:
             return response.read()
+        finally:
+            response.close()
+            response.release_conn()
+
+    def iter_bytes(self, key: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
+        """The object in chunks, without holding all of it in memory."""
+        response = self.client.get_object(self.bucket, key)
+        try:
+            yield from response.stream(chunk_size)
         finally:
             response.close()
             response.release_conn()
