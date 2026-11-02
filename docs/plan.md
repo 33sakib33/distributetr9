@@ -400,6 +400,150 @@ promoted outputs (paths relative to `promoted/`); 404 when there are none. Tests
 `{"message", "stack", "url", "user_agent"}` (any user, rate limited 20/min),
 logged as structured log lines and counted in a metric. Tests.
 
+### Stage 7: Datasets
+
+Today the only way to give a job data is inside its code upload (500 MB cap),
+and the job container has no network (`--network none`), so a script cannot
+download data either; `/cache` is per attempt. Stage 7 adds datasets: uploaded
+once, stored in MinIO by content hash, cached on each PC, mounted read-only.
+The network stays off. Decisions:
+- A dataset is one immutable blob (a `.zip`, `.tar`, `.tar.gz`, or a single
+  file) with a name and a version (`cifar10@1`). A new upload of the same name
+  is the next version. The content hash is the sha256 of the blob.
+- Datasets belong to a project (members use them; owners and maintainers upload
+  and delete) or are public (admins only; every signed-in user can use them).
+- PCs download through the control API (MinIO is not exposed to the LAN), with
+  HTTP Range so a broken download resumes.
+- Datasets need the docker executor for the `/data` mount; the python executor
+  (dev and e2e only) gets symlinks instead. Scripts find datasets through
+  `LAB_DATA` (`/data` in the container), e.g. `Path(os.environ["LAB_DATA"]) / "cifar10"`.
+- Agents without dataset support (0.7.1 and older) never get a job with
+  datasets. Stage 7 lands before R1, so the 0.8.0 release carries it.
+
+**B33. The docker executor never falls back silently.** Found on the real PC
+2026-11-02: `agent/run.sh` ignored the config's `"executor": "docker"`, and when
+`docker info` failed at startup it started the agent with the python executor,
+so a GPU job ran on the WSL host Python without torch and without isolation.
+- `run.sh` takes the executor from `LAB_EXECUTOR`, else the config file's
+  `executor`, else `auto`. With `docker` it waits up to 120 s for `docker info`
+  (starting the service once), then exits 1 so the supervisor retries; it never
+  falls back to python.
+- The agent sends `executor` at register and in heartbeats; stored as
+  `nodes.executor`, shown on `/nodes` and the node page.
+- Outside dev (`ENVIRONMENT=production` or `STRICT_EXECUTOR=1`), `claim`
+  gives no job to a node whose executor is not `docker`; pending reason "the PC
+  is not running jobs in containers (Docker is down)", and an alert of kind
+  `executor_not_docker`.
+- `explain_failure`: a `ModuleNotFoundError` from a node on the python executor
+  is a node problem ("this PC ran your job outside its container; it was
+  retried"), not a missing package, and the attempt fails as `node` (retried).
+- Tests: run.sh decision table (shell test through a stub `docker`), claim
+  refusal, failure explanation.
+
+**B34. Dataset model and upload API.**
+- Migration 0010: `datasets` (`id`, `project_id` null when public, `name`,
+  `version`, `state` uploading|processing|ready|failed|deleted, `error`,
+  `sha256`, `size_bytes`, `unpacked_bytes`, `file_count`, `format`
+  zip|tar|tgz|file, `object_key`, `upload_id`, `created_by`, `created_at`,
+  `ready_at`, `deleted_at`; unique (`project_id`, `name`, `version`)), and
+  `project_quotas.dataset_bytes` (default `DEFAULT_PROJECT_DATASET_BYTES`,
+  100 GiB).
+- Names match `^[a-z0-9][a-z0-9_-]{0,62}$`. `MAX_DATASET_BYTES` default 50 GiB.
+- Chunked upload (each request stays under Caddy's body cap):
+  `POST /datasets` `{project_id | null, name, filename, size_bytes}` → `{id,
+  version, part_size}` (refuses names in use by an `uploading` row, over-quota
+  sizes, public without admin); `PUT /datasets/{id}/parts/{n}` (raw body, 1-based,
+  `DATASET_PART_BYTES` = 64 MiB except the last) stored as a MinIO multipart
+  part, re-sending a part replaces it; `GET /datasets/{id}/parts` lists received
+  parts so the browser resumes; `POST /datasets/{id}/complete` composes the
+  object and moves to `processing`; `DELETE /datasets/{id}` aborts or deletes.
+- A processing worker (like the notifier: every 10 s, one dataset at a time)
+  streams the object once: computes sha256, detects the format, and for archives
+  checks member paths (same rules as `app/archive.py`), counts files, and sums
+  `unpacked_bytes`, refusing an archive over `MAX_DATASET_UNPACKED_BYTES`
+  (default 2 × `MAX_DATASET_BYTES`). Result `ready` or `failed` with `error`.
+  A second ready dataset with the same sha256 shares the blob (the object is
+  keyed `datasets/<sha256>`).
+- `GET /datasets?project_id=` (the project's plus public, newest version first,
+  `?all_versions=1`), `GET /datasets/{id}` (adds `jobs_30d`).
+- Delete marks `deleted`; the blob is removed by the worker once no dataset row
+  shares it and no queued or running job refers to it. Jobs already queued keep
+  working.
+- `POST /admin/datasets/import` `{name, version?, url, sha256?}` (admin, public
+  dataset): the worker downloads `http(s)` URLs server-side (size cap, 10 s
+  connect timeout, no redirects to other hosts), then processes as above.
+- Audit entries for create, delete, import. Rate limit: dataset creation uses the
+  jobs bucket.
+- Caddy: `request_body max_size` 70MB on `/datasets/*/parts/*`.
+- Tests: create/parts/resume/complete, re-sent part, quota, name rules, worker
+  (sha256, format, unsafe paths, unpacked cap, shared blob), delete rules,
+  import with a local test server, permissions (member, owner, admin, outsider).
+
+**B35. Jobs that use datasets.**
+- `POST /jobs` and `/jobs/{id}/clone` accept `datasets`: a JSON list of dataset
+  ids or `name@version` / `name` (latest ready version), at most 8, each ready
+  and usable by the submitter in the job's project. `jobs.datasets` JSONB keeps
+  a snapshot `[{id, name, version, sha256, size_bytes, unpacked_bytes, format}]`.
+- `claim_payload` adds `datasets` with `{name, sha256, size_bytes,
+  unpacked_bytes, format, url: "/attempts/{attempt}/datasets/{sha256}"}`.
+- `GET /attempts/{id}/datasets/{sha256}` (fencing token header, like
+  `/input`) streams the blob, supports `Range`, 404 for a hash the job does not
+  use.
+- `GET /jobs/{id}` shows `datasets`. `explain_failure` adds: `FileNotFoundError`
+  under `/data` or `LAB_DATA` → "attach the dataset in the submit form; it is
+  mounted at /data/<name>".
+- Tests: submit with ids and names, unusable or deleted dataset refused,
+  snapshot survives a later version, Range download, wrong hash 404, fencing.
+
+**B36. Agent dataset cache.**
+- Root `LAB_DATASET_ROOT`, default `/var/lab/datasets`, else
+  `~/.distributetr9/datasets` (same writable check as the attempt root).
+  Layout `<root>/<sha256>/` (unpacked) with `.partial` downloads and
+  `.tmp-<sha256>` unpack directories renamed into place when complete.
+- Before the job: for each dataset not cached, download with Range resume and
+  a sha256 check, unpack (same safe-path rules as the input), rename atomically.
+  A new stage `fetching_data` reports bytes done / total like `pulling_image`
+  (the renew thread already runs during the pull; same for this stage).
+  A hash mismatch deletes the partial and fails the attempt as `node`.
+- Mount each as `-v <root>/<sha256>:/data/<name>:ro` and set `LAB_DATA=/data`;
+  the python executor makes `<work>/data/<name>` symlinks and sets `LAB_DATA`
+  to `<work>/data`.
+- `dataset_last_used` in agent state. Before a download, evict unused cached
+  datasets (least recently used first, never one a running job uses) until free
+  space ≥ disk watermark + the unpacked size needed; if that is impossible the
+  attempt fails as `node` with "not enough disk for the datasets".
+- Register sends `features: ["datasets"]`; heartbeats send `datasets`: the
+  cached hashes (at most 500) and `dataset_bytes`.
+- Tests (agent, stdlib only): resume after a cut download, hash mismatch,
+  unsafe archive, eviction order and the in-use guard, mount arguments, python
+  executor symlinks, heartbeat fields.
+
+**B37. Scheduling with datasets.**
+- Migration 0010 also adds `nodes.features` (text[]), `nodes.dataset_hashes`
+  (text[]), `nodes.dataset_bytes`, `nodes.executor`; heartbeats update them.
+- `claim` skips a job with datasets on a node without the `datasets` feature,
+  and on a node whose `disk_free_bytes - disk_watermark_bytes` is smaller than
+  the unpacked size of the job's datasets that node lacks (cached bytes count
+  as reclaimable only for datasets the job does not use).
+- Affinity: a job whose datasets this node lacks is left for
+  `DATASET_AFFINITY_SECONDS` (default 120, from `created_at`, or from the last
+  requeue) when another online, claimable node of a fitting class has them all
+  cached and is free. After that any fitting node takes it.
+- Pending reasons: "waiting for a PC with agent 0.8.0 or newer (datasets)",
+  "no PC of <class> has room for <size> of datasets".
+- Metrics: `lab_dataset_bytes{scope=project|public}`,
+  `lab_dataset_fetch_bytes_total`, `lab_dataset_cache_hits_total` /
+  `_misses_total` (counted at claim). Grafana gets one panel for cache hits.
+- Tests: feature gate, disk rule, affinity wait and its expiry, pending
+  reasons, metrics.
+
+**B38. Dataset quotas and reports.**
+- `GET/PUT /admin/quotas` include `dataset_bytes` per project; usage counts
+  ready and processing datasets (shared blobs count once per project).
+- `GET /admin/datasets` (paged, `q`, `project_id`, `public=1|0`): size, sha256,
+  jobs in 30 days, PCs caching it (from `nodes.dataset_hashes`).
+- Tests.
+
 ### Frontend specifications
 
 **F1. Job page: resource graphs and stage timeline.** Uses B7, B9.
@@ -481,6 +625,29 @@ in `.github/workflows/tests.yml` that starts the stack with `scripts/dev.sh`.
 `window.onerror`/`unhandledrejection` hooks posting to `/api/client-errors`;
 API errors shown with their message and request ID.
 
+**F20. Datasets page** (B34, B38): `/datasets` lists the current project's and
+public datasets (name, versions, size, files, state, uploaded by, jobs in 30
+days, the `/data/<name>` path to copy). Upload: pick a file or a folder (folders
+zipped in the browser as in F12, no caches), name defaults from the file name,
+then chunked upload with a progress bar, pause/resume, and resume after a page
+reload (parts listed from `GET /datasets/{id}/parts`, file re-picked by name and
+size); "Processing" until ready, the error if it failed. Delete with confirm,
+shown only to owners/maintainers (admins for public). Project quota bar. The
+submit page's "Leave datasets and checkpoints out" message links here.
+
+**F21. Datasets in submit and job pages** (B35, B36): the submit form gets a
+"Datasets" multi-select (search, latest version by default, version select,
+size shown, at most 8) and a hint with the paths and a two-line `LAB_DATA`
+example; clone keeps the selection. The job page lists the datasets with their
+paths and shows the `fetching_data` stage with bytes done / total in the stage
+bar.
+
+**F22. Admin datasets** (B34, B37, B38): `/admin/datasets` (filters, sizes,
+PCs caching each, delete), "Import public dataset" form (name, URL, optional
+sha256), project dataset quotas on the quotas page, node page shows the cache
+(datasets cached, bytes) and the executor (B33), with a warning when it is not
+`docker`.
+
 ---
 
 ## Part 3: Execution packages
@@ -503,6 +670,8 @@ backend package.
 | FD | F12–F17 | P6 | |
 | P7 | B29–B32, X5, X6 | P6 | X5: notification webhooks refuse loopback/private/link-local/metadata addresses (resolved at send time) unless `NOTIFY_ALLOW_PRIVATE_WEBHOOKS=1`; X6: build tests independent of leftover pending builds |
 | FE | F18–F19 | P7 | |
+| P8 | B33–B38 | P7 | migration 0010; agent changes (run.sh, cache, mounts) stay at version 0.7.1 until R1; simulated exam gains a dataset scenario (cut download resumes, second job on the same PC is a cache hit) |
+| FF | F20–F22 | P8 | e2e: upload a small dataset, submit a `python-cpu` job that reads `LAB_DATA`, see it complete |
 | R | release | all | bump agent version once, full test suite, lint, `alembic check`, portal production build, simulated exam, docs (README, PROGRESS, runbooks, guide) |
 
 ---
@@ -592,6 +761,17 @@ deferred.
 - [ ] Q15 Nav: admin links grouped in a menu, logo never wraps; logout returns to the current origin; signed-in users on /login are redirected
 - [ ] Q16 CSS warnings (autoprefixer mixed-support end values) removed
 
+### Datasets (Stage 7)
+- [ ] B33 Docker executor never falls back silently (real-PC bug 2026-11-02)
+- [ ] B34 Dataset model and chunked upload API
+- [ ] B35 Jobs that use datasets
+- [ ] B36 Agent dataset cache
+- [ ] B37 Scheduling with datasets
+- [ ] B38 Dataset quotas and reports
+- [ ] F20 Datasets page
+- [ ] F21 Datasets in submit and job pages
+- [ ] F22 Admin datasets
+
 ### Release
 - [ ] R1 Agent version bump (single release)
 - [x] R2 Full verification (pytest, ruff, alembic check, portal build, sim exam): 510 tests pass 3 runs in a row, ruff and alembic check clean, migrations 0003 down/up clean, portal prod build ok on a copy, prod compose and Caddy valid, sim exam 13/13
@@ -609,6 +789,7 @@ deferred.
 
 ### Log
 Newest first. One line per landed package: date, package, result.
+- 2026-11-02 PLANNED Stage 7 (datasets, B33–B38, F20–F22; packages P8, FF), to land before R1 so the 0.8.0 agent carries it. B33 comes from the first real GPU test job: the PC ran it on the WSL host Python because Docker was down at agent start.
 - 2026-11-02 PAUSED by the user mid-way through the frontend QA fixes (Q1–Q16): partial portal edits are in the working tree and type-check; Q items are not ticked because the agent was stopped before verifying. To resume: re-dispatch the frontend QA package (it must first check which Q items are already done), rerun the e2e suite, then R1 (agent 0.8.0 bump + real-PC check) and R3 (docs). Nothing committed.
 
 - 2026-11-02 QA-BE: Q4, Q5, Q10 backend done, no migration (invited = `invite:` subject, cleared by every sign-in incl. dev header); tests in `test_people.py` and `test_student_view.py`; frontend ticks the Q lines
